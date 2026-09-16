@@ -1,3 +1,6 @@
+use clap::Parser;
+use rabbit_hole::services::cli::Cli;
+
 fn main() {
-    println!("Hello, world!");
+    let _ = Cli::parse();
 }
