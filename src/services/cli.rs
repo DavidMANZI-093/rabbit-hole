@@ -14,6 +14,17 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Cmd {
-    Share { path: PathBuf },
-    Fetch { url: String, dest: PathBuf },
+    Share {
+        path: PathBuf,
+
+        #[arg(long, short)]
+        verbose: bool,
+    },
+    Fetch {
+        url: String,
+        dest: PathBuf,
+
+        #[arg(long, short)]
+        verbose: bool,
+    },
 }
