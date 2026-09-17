@@ -1,22 +1,36 @@
 use std::path::PathBuf;
 
-use clap::builder::Str;
-
 use crate::info;
+use crate::ingest::ingest;
+use crate::protocol::manifest::Manifest;
 use crate::services::cli::Cmd;
 use crate::utils::log;
 
-pub fn run(cmd: Cmd) -> Result<(), String> {
+pub async fn run(cmd: Cmd) -> Result<(), String> {
     match cmd {
-        Cmd::Share { path, verbose } => run_share(ShareOpts { path, verbose }),
+        Cmd::Share {
+            path,
+            block_size,
+            verbose,
+        } => {
+            run_share(ShareOpts {
+                path,
+                block_size,
+                verbose,
+            })
+            .await
+        }
         Cmd::Fetch { url, dest, verbose } => run_fetch(FetchOpts { url, dest, verbose }),
     }
 }
 
-fn run_share(opts: ShareOpts) -> Result<(), String> {
+async fn run_share(opts: ShareOpts) -> Result<(), String> {
     log::set_verbose(opts.verbose);
 
     info!("sharing content(s) at: {}", opts.path.display());
+
+    let _ = ingest_blocking(opts.path, opts.block_size).await?;
+
     Ok(())
 }
 fn run_fetch(opts: FetchOpts) -> Result<(), String> {
@@ -28,6 +42,7 @@ fn run_fetch(opts: FetchOpts) -> Result<(), String> {
 
 struct ShareOpts {
     path: PathBuf,
+    block_size: u32,
     verbose: bool,
 }
 
@@ -35,4 +50,10 @@ struct FetchOpts {
     url: String,
     dest: PathBuf,
     verbose: bool,
+}
+
+async fn ingest_blocking(path: PathBuf, block_size: u32) -> Result<Manifest, String> {
+    tokio::task::spawn_blocking(move || ingest(path, block_size))
+        .await
+        .map_err(|e| e.to_string())?
 }
