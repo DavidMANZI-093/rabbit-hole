@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::info;
-use crate::ingest::ingest;
+use crate::ingest::{IngestStats, ingest};
 use crate::protocol::manifest::Manifest;
 use crate::services::cli::Cmd;
 use crate::utils::log;
@@ -52,7 +52,10 @@ struct FetchOpts {
     verbose: bool,
 }
 
-async fn ingest_blocking(path: PathBuf, block_size: u32) -> Result<Manifest, String> {
+async fn ingest_blocking(
+    path: PathBuf,
+    block_size: u32,
+) -> Result<(Manifest, IngestStats), String> {
     tokio::task::spawn_blocking(move || {
         ingest(&path.to_owned(), block_size).map_err(|e| e.to_string())
     })
