@@ -1,3 +1,4 @@
+pub mod fs;
 pub mod ingest;
 pub mod protocol;
 pub mod services;

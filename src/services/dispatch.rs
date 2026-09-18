@@ -53,7 +53,9 @@ struct FetchOpts {
 }
 
 async fn ingest_blocking(path: PathBuf, block_size: u32) -> Result<Manifest, String> {
-    tokio::task::spawn_blocking(move || ingest(path, block_size))
-        .await
-        .map_err(|e| e.to_string())?
+    tokio::task::spawn_blocking(move || {
+        ingest(&path.to_owned(), block_size).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
