@@ -2,6 +2,9 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 1024 * 1024; //  1,048,576 bytes or ~1MB
 pub const MIN_BLOCK_SIZE: u32 = 4096; // 4,096 bytes or ~4KB
 pub const MAX_BLOCK_SIZE: u32 = 64 * 1024 * 1024; // 67,108,864 bytes or ~64MB
 pub const MAX_PATH_LEN: usize = 4096; // 4,096 bytes or ~4KB 
+pub const MAX_FILES: u32 = 1_000_000;
+pub const MAX_BLOCKS: u32 = 32_000_000;
+pub const MAX_MANIFEST_BYTES: u32 = 256 * 1024 * 1024; // 268,435,456 bytes or ~256MB
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestError {
@@ -58,7 +61,28 @@ impl std::fmt::Display for ManifestError {
     }
 }
 
-// ---------- paths ----------
+// impl std::error::Error for ManifestError {}
+
+// ---------- unsigned LEB128 variable-length compression ----------
+//
+// 7 payload bits per byte plus one continuation bit.
+// Minimal-length form is mandatory on decode.
+
+pub fn encode_uleb(mut v: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            b |= 0x80;
+            out.push(b);
+        } else {
+            out.push(b);
+            return;
+        }
+    }
+}
+
+// ---------- paths & chunk helpers ----------
 
 pub fn validate_path(p: &str) -> Result<(), ManifestError> {
     if p.len() > MAX_PATH_LEN {
@@ -88,4 +112,12 @@ pub fn validate_path(p: &str) -> Result<(), ManifestError> {
         }
     }
     Ok(())
+}
+
+pub fn expected_chunks(size: u64, block_size: u32) -> u64 {
+    if size == 0 {
+        0
+    } else {
+        size.div_ceil(block_size as u64)
+    }
 }

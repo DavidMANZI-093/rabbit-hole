@@ -22,6 +22,8 @@ pub enum Cmd {
         #[arg(long, short, default_value_t = DEFAULT_BLOCK_SIZE, value_parser = clap::value_parser!(u32).range(MIN_BLOCK_SIZE as i64..=MAX_BLOCK_SIZE as i64))]
         block_size: u32,
         #[arg(long, short)]
+        secure: bool,
+        #[arg(long, short)]
         verbose: bool,
     },
     Fetch {

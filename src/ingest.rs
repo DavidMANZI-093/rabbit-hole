@@ -15,6 +15,8 @@ use crate::{
     },
 };
 
+const WIDTH: usize = 128 * 1024; // 131,072 bytes or ~128KB
+
 #[derive(Debug)]
 pub enum IngestError {
     Fs(FsError),
@@ -229,7 +231,7 @@ fn hash_file_inner(
 
         let mut f =
             File::open(abs).map_err(|e| IngestError::Fs(fs::map_io(abs, fs::Op::Read, e)))?;
-        let mut buffer = vec![0u8; 00];
+        let mut buffer = vec![0u8; WIDTH];
         let mut hasher = blake3::Hasher::new();
         let mut in_block: u64 = 0;
 
