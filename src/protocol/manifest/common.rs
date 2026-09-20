@@ -121,3 +121,26 @@ pub fn expected_chunks(size: u64, block_size: u32) -> u64 {
         size.div_ceil(block_size as u64)
     }
 }
+
+pub fn hex_decode32(s: &str) -> Result<[u8; 32], ManifestError> {
+    if s.len() != 64 {
+        return Err(ManifestError::BadHex("need 64 hex chars"));
+    }
+    let b = s.as_bytes();
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let hi = hexval(b[2 * i]).ok_or(ManifestError::BadHex("bad digit"))?;
+        let lo = hexval(b[2 * i + 1]).ok_or(ManifestError::BadHex("bad digit"))?;
+        out[i] = hi << 4 | lo;
+    }
+    Ok(out)
+}
+
+fn hexval(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}

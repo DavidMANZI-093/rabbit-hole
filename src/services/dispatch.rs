@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use tokio::net::TcpListener;
+
 use crate::info;
 use crate::ingest::{IngestStats, ingest};
 use crate::protocol::manifest::Manifest;
@@ -53,7 +55,60 @@ async fn run_share(opts: ShareOpts) -> Result<(), String> {
     let token = opts.secure.then(crate::services::serve::generate_token);
     let shared = build_shared(&manifest, &opts.path, token.clone())?;
 
+    info!(
+        "manifest {}",
+        format_bytes(shared.manifest_bytes.len() as u64)
+    );
+
+    let app = crate::services::serve::router(shared);
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|e| format!("bind 127.0.0.1:{}: {e}", 0))?;
+    let local = listener
+        .local_addr()
+        .map_err(|e| format!("local addr: {e}"))?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let mut server_handle = tokio::spawn(async move {
+        info!("serving on http://{local}");
+        if let Some(t) = &token {
+            info!("token {t}");
+        };
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                shutdown_rx.await.ok();
+            })
+            .await
+    });
+
+    tokio::select! {
+        _ = shutdown_signal() => eprintln!("signal: shutting down ..."),
+        r = &mut server_handle => match r {
+            Ok(Ok(())) => eprintln!("server exited cleanly"),
+            Ok(Err(e)) => eprintln!("server error: {e}"),
+            Err(e) => eprintln!("server task panicked: {e}"),
+        },
+    }
+
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+    }
 }
 
 fn run_fetch(opts: FetchOpts) -> Result<(), String> {
