@@ -194,14 +194,15 @@ pub fn ingest(
     }
 
     stats.blocks_unique = pool.len();
-    Ok((
-        Manifest {
-            block_size,
-            pool,
-            files,
-        },
-        stats,
-    ))
+    let manifest = Manifest {
+        block_size,
+        pool,
+        files,
+    };
+    manifest
+        .validate()
+        .map_err(|e| IngestError::Walk(format!("post-ingest error {}", e.to_string())));
+    Ok((manifest, stats))
 }
 
 fn single_file_manifest_path(src: &Path) -> Result<String, IngestError> {
