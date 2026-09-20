@@ -32,13 +32,13 @@ pub async fn run(cmd: Cmd) -> Result<(), String> {
 
 async fn run_share(opts: ShareOpts) -> Result<(), String> {
     log::set_verbose(opts.verbose);
-    info!("sharing content(s) at: {}", opts.path.display());
+    info!("sharing file(s) at: {}", opts.path.display());
 
     let progress = IngestProgress::new();
     let (manifest, stats) = ingest_blocking(&opts.path, opts.block_size, progress.clone()).await?;
     progress.finish_and_clear();
     info!(
-        "total files {} | {} | blocks {} ({} unique, {:.1}% dedup) | {} skipped",
+        "total files {} ({}) \n{pad:>7}blocks {} ({} unique, {:.1}% dedup) \n{pad:>7}{} skipped",
         stats.files,
         format_bytes(stats.bytes),
         stats.blocks_total,
@@ -50,6 +50,7 @@ async fn run_share(opts: ShareOpts) -> Result<(), String> {
             0.0
         },
         stats.skipped,
+        pad = "",
     );
 
     let token = opts.secure.then(crate::services::serve::generate_token);
@@ -90,6 +91,15 @@ async fn run_share(opts: ShareOpts) -> Result<(), String> {
             Err(e) => eprintln!("server task panicked: {e}"),
         },
     }
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut server_handle)
+        .await
+        .ok();
+    if !server_handle.is_finished() {
+        server_handle.abort();
+    }
+    info!("bye.");
 
     Ok(())
 }
