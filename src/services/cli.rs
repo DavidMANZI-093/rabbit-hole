@@ -44,4 +44,5 @@ pub enum Cmd {
         #[arg(long, short)]
         verbose: bool,
     },
+    Check,
 }

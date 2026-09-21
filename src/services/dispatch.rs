@@ -1,15 +1,17 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 
-use crate::info;
 use crate::ingest::{IngestStats, ingest};
 use crate::protocol::manifest::Manifest;
 use crate::services::cli::Cmd;
 use crate::services::fetch::fetch;
 use crate::services::serve::build_shared;
+use crate::services::tunnel::{self, Tunnel};
 use crate::utils::log;
 use crate::utils::progress::{FetchProgress, IngestProgress, format_bytes};
+use crate::{info, warn};
 
 pub async fn run(cmd: Cmd) -> Result<(), String> {
     match cmd {
@@ -47,6 +49,7 @@ pub async fn run(cmd: Cmd) -> Result<(), String> {
             })
             .await
         }
+        Cmd::Check => run_check().await,
     }
 }
 
@@ -103,6 +106,28 @@ async fn run_share(opts: ShareOpts) -> Result<(), String> {
             .await
     });
 
+    let mut tunnel: Option<Tunnel> = None;
+    info!("starting 'cloudflared' tunnel...");
+    match tunnel::spawn(local.port()).await {
+        Ok(t) => {
+            t.watch_exit();
+            info!("tunnel: {} - waiting for edge route", t.url);
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|e| format!("http client: {e}"))?;
+            if t.wait_until_live(&client).await {
+                info!("tunnel: live at edge");
+            } else {
+                warn!("tunnel URL not yet reachable at edge");
+            }
+            tunnel = Some(t);
+        }
+        Err(e) => {
+            warn!("tunnel failed ({e}); serving LAN-only, NOT halting");
+        }
+    }
+
     tokio::select! {
         _ = shutdown_signal() => eprintln!("signal: shutting down ..."),
         r = &mut server_handle => match r {
@@ -118,6 +143,10 @@ async fn run_share(opts: ShareOpts) -> Result<(), String> {
         .ok();
     if !server_handle.is_finished() {
         server_handle.abort();
+    }
+    if let Some(t) = tunnel {
+        t.shutdown().await;
+        info!("tunnel: stopped");
     }
     info!("bye.");
 
@@ -173,6 +202,26 @@ async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
         opts.dest.display()
     );
 
+    Ok(())
+}
+
+async fn run_check() -> Result<(), String> {
+    match std::process::Command::new("cloudflared")
+        .arg("--version")
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let v = String::from_utf8_lossy(&out.stdout);
+            info!("cloudflared: {}", v.lines().next().unwrap_or("?").trim());
+        }
+        _ => warn!("cloudflared: not in PATH (tunnel shares unavailable)"),
+    }
+    let mut probe = std::env::temp_dir();
+    probe.push(format!("rh-check-{}", std::process::id()));
+    match std::fs::write(&probe, b"ok").and_then(|_| std::fs::remove_file(&probe)) {
+        Ok(()) => info!("fs: temp writes ok"),
+        Err(e) => warn!("fs: temp write failed: {e}"),
+    }
     Ok(())
 }
 
