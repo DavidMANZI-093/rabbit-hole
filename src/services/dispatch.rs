@@ -9,7 +9,7 @@ use crate::services::cli::Cmd;
 use crate::services::fetch::fetch;
 use crate::services::serve::build_shared;
 use crate::utils::log;
-use crate::utils::progress::{IngestProgress, format_bytes};
+use crate::utils::progress::{FetchProgress, IngestProgress, format_bytes};
 
 pub async fn run(cmd: Cmd) -> Result<(), String> {
     match cmd {
@@ -146,21 +146,30 @@ async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
 
     info!("fetching file(s) from: {}", opts.url);
 
-    let stats = fetch(
+    let progress = FetchProgress::new(opts.concurrency);
+    let result = fetch(
         &opts.url,
         &opts.dest,
         opts.timeout,
         opts.bearer,
         opts.force,
         opts.concurrency,
+        &progress,
     )
-    .await?;
+    .await;
+    progress.finish_and_clear();
+    let stats = result?;
 
     info!(
-        "done: {} files, {} bytes, {} blocks, {}",
+        "total files {} ({})\n{:7}blocks {} ({} fetched, {} failed) | retries {}\n{:7}dest {}",
         stats.files,
-        stats.bytes,
+        format_bytes(stats.bytes),
+        "",
         stats.blocks,
+        stats.blocks,
+        stats.failed,
+        stats.retries,
+        "",
         opts.dest.display()
     );
 

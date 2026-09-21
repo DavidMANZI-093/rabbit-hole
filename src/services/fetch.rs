@@ -5,7 +5,9 @@ use reqwest::Client;
 use crate::{
     error,
     fs::system_time_from_ns,
-    protocol::manifest::{Manifest, common::hex_encode},
+    info,
+    protocol::manifest::{CURRENT, Manifest, common::hex_encode, v1::MAGIC},
+    utils::progress::{FetchProgress, format_bytes},
     warn,
 };
 
@@ -19,6 +21,8 @@ pub struct FetchStats {
     pub files: usize,
     pub bytes: u64,
     pub blocks: usize,
+    pub retries: u64,
+    pub failed: usize,
 }
 
 pub async fn fetch(
@@ -28,6 +32,7 @@ pub async fn fetch(
     bearer: Option<String>,
     force: bool,
     concurrency: u8,
+    progress: &FetchProgress,
 ) -> Result<FetchStats, String> {
     let base = normalize_base(url)?;
     let client = Client::builder()
@@ -35,7 +40,7 @@ pub async fn fetch(
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
-    let manifest = pull_manifest(&client, &base, bearer.as_deref()).await?;
+    let (manifest, wire_len) = pull_manifest(&client, &base, bearer.as_deref()).await?;
 
     prepare_dest(dest, force)?;
 
@@ -70,6 +75,31 @@ pub async fn fetch(
     let n_unique = stage.len();
     let bytes_total: u64 = manifest.files.iter().map(|f| f.size).sum();
 
+    info!(
+        "manifest file {} ({} B)\n{:7}{} files\n{:7}{}\n{:7}{} blocks\n{:7}protocol {} v{}",
+        format_bytes(wire_len),
+        wire_len,
+        "",
+        manifest.files.len(),
+        "",
+        format_bytes(bytes_total),
+        "",
+        n_unique,
+        "",
+        std::str::from_utf8(&MAGIC).unwrap_or("?"),
+        CURRENT,
+    );
+
+    progress.begin(
+        manifest
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.size))
+            .collect(),
+        n_unique as u64,
+        bytes_total,
+    );
+
     let out_files = Arc::new(out_files);
     let base = Arc::new(base);
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1) as usize));
@@ -81,8 +111,14 @@ pub async fn fetch(
         let client = client.clone();
         let base = base.clone();
         let sem = sem.clone();
+        let prog = progress.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
+            let slot = prog.acquire_slot();
+            let primary = locs.first().map(|(fi, _)| *fi);
+            if let Some(fi) = primary {
+                prog.slot_begin(slot, fi);
+            }
             let hex = hex_encode(&digest);
 
             let mut last_err = "unreachable".to_string();
@@ -92,36 +128,74 @@ pub async fn fetch(
                         if blake3::hash(&data).as_bytes() != &digest {
                             last_err = format!("hash mismatch for block {hex}");
                         } else {
+                            let mut primary_total = 0u64;
+                            let mut primary_size = 0u64;
                             for (fi, off) in &locs {
-                                crate::fs::write_at(&files[*fi], &data, *off)
-                                    .map_err(|e| format!("write block {hex} at {off}: {e}"))?;
+                                let size = prog.file_size(*fi);
+                                let add = (data.len() as u64).min(size.saturating_sub(*off));
+                                let new_total = prog.add_file_bytes(*fi, add);
+                                if let Err(e) =
+                                    crate::fs::write_at(&files[*fi], &data[..add as usize], *off)
+                                {
+                                    prog.release_slot(slot);
+                                    return Err(format!("write block {hex} at {off}: {e}"));
+                                }
+                                if Some(*fi) == primary {
+                                    primary_total = new_total;
+                                    primary_size = size;
+                                }
                             }
+                            prog.add_bytes(data.len() as u64);
+                            prog.inc_blocks();
+                            if let Some(fi) = primary {
+                                if primary_total >= primary_size {
+                                    prog.slot_done(slot, fi);
+                                } else {
+                                    prog.slot_progress(slot, fi);
+                                }
+                            }
+                            prog.release_slot(slot);
                             return Ok::<(), String>(());
                         }
                     }
                     Err(e) => last_err = e,
                 }
                 if attempt <= RETRIES {
+                    prog.inc_retries();
+                    if let Some(fi) = primary {
+                        prog.slot_retry(slot, fi, attempt + 1);
+                    }
                     tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
                 }
             }
+            prog.inc_failed();
+            prog.slot_failed(slot, &hex, &last_err);
+            prog.release_slot(slot);
             Err(format!("block {hex}: {last_err}"))
         }));
     }
 
     let mut failed = 0usize;
+    let mut err_lines: Vec<String> = Vec::new();
     for t in tasks {
         match t.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 failed += 1;
-                eprintln!("error: {e}");
+                if err_lines.len() < 5 {
+                    err_lines.push(e);
+                }
             }
             Err(e) => {
                 failed += 1;
-                eprintln!("error: task panicked: {e}");
+                if err_lines.len() < 5 {
+                    err_lines.push(format!("task panicked: {e}"));
+                }
             }
         }
+    }
+    for e in err_lines {
+        error!("{e}");
     }
 
     if failed > 0 {
@@ -159,6 +233,8 @@ pub async fn fetch(
         files: manifest.files.len(),
         bytes: bytes_total,
         blocks: n_unique,
+        retries: progress.retries(),
+        failed: 0,
     })
 }
 
@@ -177,7 +253,7 @@ pub async fn pull_manifest(
     client: &Client,
     base: &str,
     token: Option<&str>,
-) -> Result<Manifest, String> {
+) -> Result<(Manifest, u64), String> {
     let mut last_err = String::new();
     for attempt in 1..=(1 + RETRIES) {
         let mut req = client.get(format!("{base}/__rh__/manifest"));
@@ -192,11 +268,12 @@ pub async fn pull_manifest(
                         .bytes()
                         .await
                         .map_err(|e| format!("read manifest body: {e}"))?;
+                    let wire_len = bytes.len() as u64;
                     let bytes = bytes.to_vec();
                     let manifest = crate::protocol::manifest::decode(&bytes)
                         .map_err(|e| format!("decode manifest: {e}"))?;
 
-                    return Ok(manifest);
+                    return Ok((manifest, wire_len));
                 }
                 s if s.as_u16() == 401 => {
                     return Err("manifest: 401 — wrong or missing --token".into());
@@ -214,7 +291,7 @@ pub async fn pull_manifest(
         }
     }
 
-    Err(format!("{last_err}"))
+    Err(last_err)
 }
 
 fn prepare_dest(dest: &Path, force: bool) -> Result<(), String> {
