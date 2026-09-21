@@ -6,6 +6,7 @@ use crate::info;
 use crate::ingest::{IngestStats, ingest};
 use crate::protocol::manifest::Manifest;
 use crate::services::cli::Cmd;
+use crate::services::fetch::fetch;
 use crate::services::serve::build_shared;
 use crate::utils::log;
 use crate::utils::progress::{IngestProgress, format_bytes};
@@ -26,7 +27,26 @@ pub async fn run(cmd: Cmd) -> Result<(), String> {
             })
             .await
         }
-        Cmd::Fetch { url, dest, verbose } => run_fetch(FetchOpts { url, dest, verbose }),
+        Cmd::Fetch {
+            url,
+            dest,
+            timeout,
+            bearer,
+            force,
+            concurrency,
+            verbose,
+        } => {
+            run_fetch(FetchOpts {
+                url,
+                dest,
+                timeout,
+                bearer,
+                force,
+                concurrency,
+                verbose,
+            })
+            .await
+        }
     }
 }
 
@@ -121,10 +141,29 @@ async fn shutdown_signal() {
     }
 }
 
-fn run_fetch(opts: FetchOpts) -> Result<(), String> {
+async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
     log::set_verbose(opts.verbose);
 
-    info!("fetching content(s) from: {}", opts.url);
+    info!("fetching file(s) from: {}", opts.url);
+
+    let stats = fetch(
+        &opts.url,
+        &opts.dest,
+        opts.timeout,
+        opts.bearer,
+        opts.force,
+        opts.concurrency,
+    )
+    .await?;
+
+    info!(
+        "done: {} files, {} bytes, {} blocks, {}",
+        stats.files,
+        stats.bytes,
+        stats.blocks,
+        opts.dest.display()
+    );
+
     Ok(())
 }
 
@@ -138,6 +177,10 @@ struct ShareOpts {
 struct FetchOpts {
     url: String,
     dest: PathBuf,
+    timeout: u32,
+    bearer: Option<String>,
+    force: bool,
+    concurrency: u8,
     verbose: bool,
 }
 

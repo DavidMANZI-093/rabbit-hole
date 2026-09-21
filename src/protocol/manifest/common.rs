@@ -13,7 +13,7 @@ pub enum ManifestError {
     UnknownFlags(u16),
     BadBlockSize(u32),
     Truncated { at: usize, need: usize },
-    TooLarge(usize),
+    TooLarge(u32),
     NonCanonical,
     Overflow,
     OverLimit(u64, u64),
@@ -82,6 +82,101 @@ pub fn encode_uleb(mut v: u64, out: &mut Vec<u8>) {
     }
 }
 
+fn encoded_uleb_len(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+pub struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8], ManifestError> {
+        let end = self.pos.checked_add(n).ok_or(ManifestError::Overflow)?;
+        if end > self.buf.len() {
+            return Err(ManifestError::Truncated {
+                at: self.pos,
+                need: n,
+            });
+        }
+        let s = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(s)
+    }
+
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    pub fn u16_le(&mut self) -> Result<u16, ManifestError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().map_err(
+            |_| ManifestError::Truncated {
+                at: self.pos,
+                need: 2,
+            },
+        )?))
+    }
+
+    pub fn u32_le(&mut self) -> Result<u32, ManifestError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().map_err(
+            |_| ManifestError::Truncated {
+                at: self.pos,
+                need: 4,
+            },
+        )?))
+    }
+
+    pub fn uleb(&mut self) -> Result<u64, ManifestError> {
+        let start = self.pos;
+        let mut val: u64 = 0;
+        let mut shift = 0u32;
+        loop {
+            if self.pos >= self.buf.len() {
+                return Err(ManifestError::Truncated { at: start, need: 1 });
+            }
+            if shift >= 70 {
+                return Err(ManifestError::Overflow);
+            }
+            let b = self.buf[self.pos];
+            self.pos += 1;
+            if shift >= 64 && (b & 0x7f) != 0 {
+                return Err(ManifestError::Overflow);
+            }
+            val |= ((b & 0x7f) as u64) << shift;
+            let done = b & 0x80 == 0;
+            shift += 7;
+            if done {
+                if self.pos - start != encoded_uleb_len(val) {
+                    return Err(ManifestError::NonCanonical);
+                }
+                return Ok(val);
+            }
+            if self.pos - start > 10 {
+                return Err(ManifestError::Overflow);
+            }
+        }
+    }
+
+    pub fn i64_le(&mut self) -> Result<i64, ManifestError> {
+        Ok(i64::from_le_bytes(self.take(8)?.try_into().map_err(
+            |_| ManifestError::Truncated {
+                at: self.pos,
+                need: 8,
+            },
+        )?))
+    }
+}
+
 // ---------- paths & chunk helpers ----------
 
 pub fn validate_path(p: &str) -> Result<(), ManifestError> {
@@ -143,4 +238,14 @@ fn hexval(c: u8) -> Option<u8> {
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
+}
+
+pub fn hex_encode(b: &[u8]) -> String {
+    const H: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(b.len() * 2);
+    for &x in b {
+        s.push(H[(x >> 4) as usize] as char);
+        s.push(H[(x & 15) as usize] as char);
+    }
+    s
 }

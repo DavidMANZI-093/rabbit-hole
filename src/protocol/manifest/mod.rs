@@ -1,6 +1,6 @@
 use crate::protocol::manifest::common::{
-    MAX_BLOCK_SIZE, MAX_BLOCKS, MAX_FILES, MAX_PATH_LEN, MIN_BLOCK_SIZE, ManifestError,
-    expected_chunks, validate_path,
+    MAX_BLOCK_SIZE, MAX_BLOCKS, MAX_FILES, MAX_MANIFEST_BYTES, MAX_PATH_LEN, MIN_BLOCK_SIZE,
+    ManifestError, expected_chunks, validate_path,
 };
 
 pub mod common;
@@ -86,4 +86,27 @@ pub fn encode(m: &Manifest) -> Vec<u8> {
         1 => v1::encode(m),
         _ => unreachable!("CURRENT has no encode"),
     }
+}
+
+pub fn decode(input: &[u8]) -> Result<Manifest, ManifestError> {
+    if input.len() > MAX_MANIFEST_BYTES as usize {
+        return Err(ManifestError::TooLarge(MAX_MANIFEST_BYTES));
+    }
+    match peek_version(input)? {
+        1 => v1::decode(input),
+        v => Err(ManifestError::UnsupportedVersion(v)),
+    }
+}
+
+pub fn peek_version(input: &[u8]) -> Result<u16, common::ManifestError> {
+    if input.len() < 4 {
+        return Err(common::ManifestError::Truncated { at: 0, need: 4 });
+    }
+    if input[..4] != v1::MAGIC {
+        return Err(common::ManifestError::BadMagic);
+    }
+    if input.len() < 6 {
+        return Err(common::ManifestError::Truncated { at: 4, need: 2 });
+    }
+    Ok(u16::from_le_bytes([input[4], input[5]]))
 }

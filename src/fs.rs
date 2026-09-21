@@ -1,7 +1,9 @@
 use std::{
-    fmt, io,
+    fmt,
+    fs::File,
+    io,
     path::{Component, Path, PathBuf},
-    time::UNIX_EPOCH,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +136,78 @@ fn mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|d| i64::try_from(d.as_nanos()).ok())
+}
+
+// Ensures concurrent `pwrite` allocations don't scatter causing fragmentation,
+// fewer fs metadata inquiries, space availability, and true parallelism.
+pub fn preallocate(f: &File, size: u64) -> Result<(), FsError> {
+    f.set_len(size).map_err(FsError::Other)
+}
+
+// `mtime` failures and `chmod` failures return `Err`; leniency remains call-site's
+// policy, not this layer's.
+pub fn apply_metadata(
+    path: &Path,
+    mode: Option<u32>,
+    mtime_ns: Option<i64>,
+) -> Result<(), FsError> {
+    #[cfg(unix)]
+    if let Some(m) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(m))
+            .map_err(|e| map_io(path, Op::SetMeta, e))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode; // inapplicable: no mode bits to restore
+    if let Some(ns) = mtime_ns
+        && let Some(st) = system_time_from_ns(ns)
+    {
+        File::options()
+            .read(true)
+            .open(path)
+            .map_err(|e| map_io(path, Op::SetMeta, e))?
+            .set_modified(st)
+            .map_err(|e| map_io(path, Op::SetMeta, e))?;
+    }
+    Ok(())
+}
+
+pub fn system_time_from_ns(ns: i64) -> Option<SystemTime> {
+    if ns >= 0 {
+        Some(UNIX_EPOCH + Duration::from_nanos(ns as u64))
+    } else {
+        UNIX_EPOCH.checked_sub(Duration::from_nanos(ns.unsigned_abs()))
+    }
+}
+
+// ---------- positional I/O ----------
+
+// `pwrite` equivalent. Same platform notes as above, [`read_at`].
+pub fn write_at(f: &File, buf: &[u8], offset: u64) -> Result<usize, FsError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.write_at(buf, offset).map_err(FsError::Other)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        f.seek_write(buf, offset).map_err(FsError::Other)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (f, buf, offset);
+        Err(FsError::Other(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "positional writes need unix or windows",
+        )))
+    }
+}
+
+// Ensures handling of errors that would otherwise only be caught
+// when the `File` is closed,
+pub fn sync(f: &File) -> Result<(), FsError> {
+    f.sync_all().map_err(FsError::Other)
 }
 
 // ---------- path helpers for ingest ----------
