@@ -291,7 +291,10 @@ mod tests {
 
     #[test]
     fn simple_filename_converts_unchanged() {
-        assert_eq!(rel_to_unix(Path::new("foo.txt")), Some("foo.txt".to_string()));
+        assert_eq!(
+            rel_to_unix(Path::new("foo.txt")),
+            Some("foo.txt".to_string())
+        );
     }
 
     #[test]

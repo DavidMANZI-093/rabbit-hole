@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn large_file_chunk_count_is_correct() {
         let size = 10 * 1024 * 1024u64; // 10 MiB
-        let bs = 1024 * 1024u32;        // 1 MiB
+        let bs = 1024 * 1024u32; // 1 MiB
         assert_eq!(expected_chunks(size, bs), 10);
     }
 

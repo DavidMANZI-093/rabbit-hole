@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
+static COLOR: AtomicBool = AtomicBool::new(false);
 
 pub fn set_verbose(on: bool) {
     VERBOSE.store(on, Ordering::Relaxed);
@@ -10,15 +11,51 @@ pub fn is_verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
 }
 
-// `emit` must be public so macros can expand to it at the call site.
-// It is marked `#[doc(hidden)]` to discourage direct use outside of macros.
-#[doc(hidden)]
-pub fn emit(level: &str, args: std::fmt::Arguments<'_>) {
-    eprintln!("{}", format_line(level, args));
+pub fn init_color(no_color_flag: bool) {
+    use std::io::IsTerminal;
+    let on = !no_color_flag && std::io::stderr().is_terminal();
+    COLOR.store(on, Ordering::Relaxed);
 }
 
-fn format_line(level: &str, args: std::fmt::Arguments<'_>) -> String {
-    format!("({level}) {args}")
+pub fn is_color() -> bool {
+    COLOR.load(Ordering::Relaxed)
+}
+
+// dim ANSI escape — used for the label column
+pub fn dim(s: &str) -> String {
+    if is_color() {
+        format!("\x1b[2m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+// bold — used for URLs
+pub fn bold(s: &str) -> String {
+    if is_color() {
+        format!("\x1b[1m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+// yellow — used for warnings
+pub fn yellow(s: &str) -> String {
+    if is_color() {
+        format!("\x1b[33m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+// `emit` must be public so macros can expand to it at the call site.
+#[doc(hidden)]
+pub fn emit(level: &str, args: std::fmt::Arguments<'_>) {
+    match level {
+        "warn" => eprintln!("  {}  {args}", yellow("warn")),
+        "debug" => eprintln!("  dbg  {args}"),
+        _ => eprintln!("  {args}"),
+    }
 }
 
 #[macro_export]
