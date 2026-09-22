@@ -35,10 +35,21 @@ pub async fn fetch(
     progress: &FetchProgress,
 ) -> Result<FetchStats, String> {
     let base = normalize_base(url)?;
-    let client = Client::builder()
-        .timeout(Duration::from_millis(timeout as u64))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
+    let mut builder = Client::builder().timeout(Duration::from_millis(timeout as u64));
+    let host = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+        .unwrap_or(&base)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if host.ends_with(".trycloudflare.com") {
+        let state = crate::utils::dns::resolve_all_doh(host).await;
+        if !state.addrs.is_empty() {
+            builder = builder.resolve_to_addrs(host, &state.addrs);
+        }
+    }
+    let client = builder.build().map_err(|e| format!("http client: {e}"))?;
 
     let (manifest, wire_len) = pull_manifest(&client, &base, bearer.as_deref()).await?;
 

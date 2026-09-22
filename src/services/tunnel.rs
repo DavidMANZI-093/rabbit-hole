@@ -9,16 +9,26 @@ use std::{
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::warn;
+use crate::{utils::ui::prettify, warn};
 
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(45);
+// the "Registered tunnel connection ... protocol=quic" line appears within milliseconds
+// of the URL line — 600ms is generous but cheap to wait
+const PROTOCOL_PEEK: Duration = Duration::from_millis(600);
 
 pub async fn spawn(port: u16) -> Result<Tunnel, String> {
-    let url = format!("http://127.0.0.1:{port}");
+    let origin = format!("http://127.0.0.1:{port}");
     let mut cmd = tokio::process::Command::new("cloudflared");
-
-    cmd.args(["tunnel", "--no-autoupdate", "--url", &url]);
+    cmd.args([
+        "tunnel",
+        "--no-autoupdate",
+        "--no-prechecks", // skip post-connection diagnostic table (~6s we don't need)
+        "--metrics",
+        "localhost:0", // random port — avoids conflicts with existing instances
+        "--url",
+        &origin,
+    ]);
 
     let mut child = cmd
         .stdin(Stdio::null())
@@ -26,7 +36,7 @@ pub async fn spawn(port: u16) -> Result<Tunnel, String> {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("spawning `cloudflared`: {e}"))?;
+        .map_err(|e| format!("spawning cloudflared: {e}"))?;
 
     let stderr = child
         .stderr
@@ -34,6 +44,7 @@ pub async fn spawn(port: u16) -> Result<Tunnel, String> {
         .ok_or_else(|| "cloudflared stderr not piped".to_string())?;
     let mut lines = BufReader::new(stderr).lines();
 
+    // Phase 1: wait for subdomain assignment (~5s API round-trip to trycloudflare.com)
     let url = tokio::time::timeout(START_TIMEOUT, async {
         while let Some(line) = lines
             .next_line()
@@ -49,12 +60,27 @@ pub async fn spawn(port: u16) -> Result<Tunnel, String> {
     .await
     .map_err(|_| "timed out waiting for cloudflared URL (60s)".to_string())??;
 
+    // Phase 2: peek briefly for the protocol log line which follows immediately
+    // e.g. "Registered tunnel connection connIndex=0 ... protocol=quic"
+    let protocol: Option<String> = tokio::time::timeout(PROTOCOL_PEEK, async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(p) = sniff_protocol(&line) {
+                return Some(p);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+
     tokio::spawn(async move { while lines.next_line().await.ok().flatten().is_some() {} });
 
     Ok(Tunnel {
         child: Arc::new(tokio::sync::Mutex::new(child)),
         dismissed: Arc::new(AtomicBool::new(false)),
         url,
+        protocol,
     })
 }
 
@@ -62,6 +88,7 @@ pub struct Tunnel {
     child: Arc<tokio::sync::Mutex<tokio::process::Child>>,
     dismissed: Arc<AtomicBool>,
     pub url: String,
+    pub protocol: Option<String>,
 }
 
 impl Tunnel {
@@ -74,14 +101,50 @@ impl Tunnel {
         let _ = child.wait().await;
     }
 
-    pub async fn wait_until_live(&self, client: &reqwest::Client) -> bool {
+    pub async fn wait_until_live<F>(&self, on_status: F) -> bool
+    where
+        F: Fn(&str),
+    {
         let probe = format!("{}/__rh__/health", self.url);
+        let host = self
+            .url
+            .strip_prefix("https://")
+            .or_else(|| self.url.strip_prefix("http://"))
+            .unwrap_or(&self.url)
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+
         let start = tokio::time::Instant::now();
         while start.elapsed() < LIVE_TIMEOUT {
-            match tokio::time::timeout(Duration::from_secs(5), client.get(&probe).send()).await {
-                Ok(Ok(r)) if r.status().is_success() => return true,
-                _ => tokio::time::sleep(Duration::from_secs(1)).await,
+            let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(3));
+            if host.ends_with(".trycloudflare.com") {
+                let state = crate::utils::dns::resolve_all_doh(&host).await;
+                let msg = format!(
+                    "propagating... [cf: {}  google: {}  quad9: {}]",
+                    prettify(state.cloudflare.label()),
+                    prettify(state.google.label()),
+                    prettify(state.quad9.label())
+                );
+                on_status(&msg);
+
+                if !state.addrs.is_empty() {
+                    builder = builder.resolve_to_addrs(&host, &state.addrs);
+                }
+            } else {
+                on_status("activating...");
             }
+
+            if let Ok(client) = builder.build()
+                && let Ok(Ok(r)) =
+                    tokio::time::timeout(Duration::from_secs(3), client.get(&probe).send()).await
+                && r.status().is_success()
+            {
+                return true;
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         false
     }
@@ -128,4 +191,15 @@ fn sniff_url(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn sniff_protocol(line: &str) -> Option<String> {
+    // matches "protocol=quic" or "protocol=http2" in cloudflared log lines
+    let pos = line.find("protocol=")?;
+    let rest = &line[pos + "protocol=".len()..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '"' || c == ',')
+        .unwrap_or(rest.len());
+    let proto = &rest[..end];
+    matches!(proto, "quic" | "http2" | "http3").then(|| proto.to_string())
 }

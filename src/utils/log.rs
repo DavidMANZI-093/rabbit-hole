@@ -21,7 +21,6 @@ pub fn is_color() -> bool {
     COLOR.load(Ordering::Relaxed)
 }
 
-// dim ANSI escape — used for the label column
 pub fn dim(s: &str) -> String {
     if is_color() {
         format!("\x1b[2m{s}\x1b[0m")
@@ -30,7 +29,6 @@ pub fn dim(s: &str) -> String {
     }
 }
 
-// bold — used for URLs
 pub fn bold(s: &str) -> String {
     if is_color() {
         format!("\x1b[1m{s}\x1b[0m")
@@ -39,12 +37,53 @@ pub fn bold(s: &str) -> String {
     }
 }
 
-// yellow — used for warnings
+pub fn cyan(s: &str) -> String {
+    if is_color() {
+        format!("\x1b[34m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
 pub fn yellow(s: &str) -> String {
     if is_color() {
         format!("\x1b[33m{s}\x1b[0m")
     } else {
         s.to_string()
+    }
+}
+
+pub fn green(s: &str) -> String {
+    if is_color() {
+        format!("\x1b[32m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+pub fn red(s: &str) -> String {
+    if is_color() {
+        format!("\x1b[31m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+// U+2713 CHECK MARK on TTY, plain "ok" otherwise.
+pub fn check_ok() -> String {
+    if is_color() {
+        green("✓")
+    } else {
+        "ok".to_string()
+    }
+}
+
+// U+2717 BALLOT X on TTY, plain "fail" otherwise.
+pub fn check_fail() -> String {
+    if is_color() {
+        red("✗")
+    } else {
+        "fail".to_string()
     }
 }
 

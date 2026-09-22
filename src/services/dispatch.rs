@@ -1,5 +1,4 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, UdpSocket},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -12,8 +11,13 @@ use crate::services::cli::Cmd;
 use crate::services::fetch::fetch;
 use crate::services::serve::build_shared;
 use crate::services::tunnel::{self, Tunnel};
-use crate::utils::log::{self, bold, dim, yellow};
-use crate::utils::progress::{FetchProgress, IngestProgress, format_bytes};
+use crate::utils::log::{self, check_fail, check_ok};
+use crate::utils::net::{lan_ip, shutdown_signal};
+use crate::utils::progress::{FetchProgress, IngestProgress};
+use crate::utils::ui::{
+    dlabel, print_fetch_summary, print_ingest_summary, print_manifest_line, print_wan_and_fetch,
+    tunnel_spinner,
+};
 use crate::{info, warn};
 
 pub async fn run(cmd: Cmd) -> Result<(), String> {
@@ -60,6 +64,8 @@ pub async fn run(cmd: Cmd) -> Result<(), String> {
     }
 }
 
+// ---------- serve ----------
+
 async fn run_serve(opts: ServeOpts) -> Result<(), String> {
     log::set_verbose(opts.verbose);
 
@@ -72,9 +78,10 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
     let token = opts.secure.then(crate::services::serve::generate_token);
     let shared = build_shared(&manifest, &opts.path, token.clone())?;
 
+    print_manifest_line(shared.manifest_bytes.len() as u64);
+
     let app = crate::services::serve::router(shared.clone());
 
-    // bind on all interfaces so LAN receivers can connect
     let listener = TcpListener::bind(("0.0.0.0", 0u16))
         .await
         .map_err(|e| format!("bind: {e}"))?;
@@ -83,8 +90,7 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
         .map_err(|e| format!("local addr: {e}"))?
         .port();
 
-    let lan_ip = lan_ip();
-    let lan_url = format!("http://{}:{port}", lan_ip);
+    let lan_url = format!("http://{}:{port}", lan_ip());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -96,45 +102,11 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
             .await
     });
 
-    // LAN URL is available now — print it immediately so the user has something to copy
-    // before the tunnel warms up (which can take several seconds)
-    print_manifest_line(shared.manifest_bytes.len() as u64);
-    eprintln!(
-        "  {label:<8}  {url}",
-        label = dim("LAN"),
-        url = bold(&lan_url)
-    );
+    eprintln!("  {}  {}", dlabel("LAN"), crate::utils::log::bold(&lan_url));
 
-    // start tunnel; print WAN URL once confirmed live
-    let wan_url: Option<String>;
-    let mut tunnel: Option<Tunnel> = None;
+    let (wan_url, tunnel) = start_tunnel(port).await;
 
-    match tunnel::spawn(port).await {
-        Ok(t) => {
-            t.watch_exit();
-            let tunnel_url = t.url.clone();
-
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|e| format!("http client: {e}"))?;
-
-            if t.wait_until_live(&client).await {
-                wan_url = Some(tunnel_url);
-            } else {
-                warn!("tunnel URL not yet reachable at edge");
-                wan_url = Some(t.url.clone());
-            }
-            tunnel = Some(t);
-        }
-        Err(e) => {
-            warn!("cloudflared not found ({e}) — LAN only (run: rh check)");
-            wan_url = None;
-        }
-    }
-
-    // print WAN URL + the actionable fetch command
-    print_urls_remaining(&lan_url, wan_url.as_deref(), token.as_deref());
+    print_wan_and_fetch(&lan_url, wan_url.as_deref(), token.as_deref());
 
     let mut server_handle = server_handle;
     tokio::select! {
@@ -161,96 +133,30 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
     Ok(())
 }
 
-// ---------- output helpers ----------
+async fn start_tunnel(port: u16) -> (Option<String>, Option<Tunnel>) {
+    let spinner = tunnel_spinner();
+    spinner.set_message("requesting...");
 
-fn print_ingest_summary(stats: &IngestStats) {
-    let dedup_pct = if stats.blocks_total > 0 {
-        (stats.blocks_total - stats.blocks_unique as u64) as f64 / stats.blocks_total as f64 * 100.0
-    } else {
-        0.0
-    };
-    eprintln!(
-        "  {files:<8}  {n}   {size}",
-        files = dim("files"),
-        n = stats.files,
-        size = format_bytes(stats.bytes),
-    );
-    eprintln!(
-        "  {blocks:<8}  {total}   {unique} unique   {dedup_pct:.1}% dedup",
-        blocks = dim("blocks"),
-        total = stats.blocks_total,
-        unique = stats.blocks_unique,
-    );
-    if stats.skipped > 0 {
-        eprintln!(
-            "  {skipped:<8}  {} skipped",
-            stats.skipped,
-            skipped = yellow("warn"),
-        );
-    }
-    eprintln!();
-}
-
-fn print_manifest_line(len: u64) {
-    eprintln!(
-        "  {label:<8}  {size}",
-        label = dim("manifest"),
-        size = format_bytes(len)
-    );
-    eprintln!();
-}
-
-fn print_urls_remaining(lan: &str, wan: Option<&str>, token: Option<&str>) {
-    if let Some(wan_url) = wan {
-        eprintln!(
-            "  {label:<8}  {url}",
-            label = dim("WAN"),
-            url = bold(wan_url)
-        );
-    }
-    let fetch_cmd = match (wan, token) {
-        (Some(wan_url), Some(_)) => format!("rh fetch {wan_url} <dest> --bearer <token>"),
-        (Some(wan_url), None) => format!("rh fetch {wan_url} <dest>"),
-        (None, Some(_)) => format!("rh fetch {lan} <dest> --bearer <token>"),
-        (None, None) => format!("rh fetch {lan} <dest>"),
-    };
-    if let Some(t) = token {
-        eprintln!();
-        eprintln!("  {label:<8}  {t}", label = dim("token"));
-    }
-    eprintln!();
-    eprintln!("  {fetch_cmd}");
-    eprintln!();
-}
-
-// probes the routing table — returns the IP that would be used to reach 8.8.8.8
-// (no packet is actually sent; this is just a socket trick to read the kernel's choice)
-fn lan_ip() -> IpAddr {
-    UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect("8.8.8.8:80")?;
-            s.local_addr()
-        })
-        .map(|a| a.ip())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
-}
-
-// ---------- shutdown ----------
-
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => {},
-            _ = term.recv() => {},
+    match tunnel::spawn(port).await {
+        Ok(t) => {
+            t.watch_exit();
+            let url_clone = t.url.clone();
+            let live = t
+                .wait_until_live(|msg| {
+                    spinner.set_message(format!("{url_clone}  {msg}",));
+                })
+                .await;
+            spinner.finish_and_clear();
+            if !live {
+                warn!("tunnel URL not yet reachable at edge — sharing anyway");
+            }
+            (Some(t.url.clone()), Some(t))
         }
-    }
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await.ok();
+        Err(e) => {
+            spinner.finish_and_clear();
+            warn!("cloudflared not found ({e}) — LAN only (run: rh check)");
+            (None, None)
+        }
     }
 }
 
@@ -275,22 +181,14 @@ async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
     progress.finish_and_clear();
     let stats = result?;
 
-    eprintln!();
-    eprintln!(
-        "  {label:<8}  {n}   {size}",
-        label = dim("files"),
-        n = stats.files,
-        size = format_bytes(stats.bytes),
+    print_fetch_summary(
+        stats.files,
+        stats.bytes,
+        stats.blocks,
+        stats.failed,
+        stats.retries,
+        &opts.dest,
     );
-    eprintln!(
-        "  {label:<8}  {n}   {failed} failed   {retries} retries",
-        label = dim("blocks"),
-        n = stats.blocks,
-        failed = stats.failed,
-        retries = stats.retries,
-    );
-    eprintln!("  {label:<8}  {}", opts.dest.display(), label = dim("dest"),);
-    eprintln!();
 
     Ok(())
 }
@@ -298,26 +196,48 @@ async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
 // ---------- check ----------
 
 async fn run_check() -> Result<(), String> {
+    // longest label is n chars; pad to n + 1
+    let lbl = |s: &str| crate::utils::log::dim(&format!("{s:<12}"));
+
+    // cloudflared
     match std::process::Command::new("cloudflared")
         .arg("--version")
         .output()
     {
         Ok(out) if out.status.success() => {
-            let v = String::from_utf8_lossy(&out.stdout);
-            info!("cloudflared  {}", v.lines().next().unwrap_or("?").trim());
+            let raw = String::from_utf8_lossy(&out.stdout);
+            let ver = raw.lines().next().unwrap_or("?").trim().to_string();
+            eprintln!("  {}  {}   {}", lbl("cloudflared"), ver, check_ok());
         }
-        _ => warn!("cloudflared: not in PATH — tunnel shares unavailable"),
+        _ => {
+            eprintln!(
+                "  {}  not in PATH   {}   (run: sudo apt install cloudflared)",
+                lbl("cloudflared"),
+                check_fail()
+            );
+        }
     }
+
+    // temp dir write
     let mut probe = std::env::temp_dir();
     probe.push(format!("rh-check-{}", std::process::id()));
     match std::fs::write(&probe, b"ok").and_then(|_| std::fs::remove_file(&probe)) {
-        Ok(()) => info!("temp writes ok"),
-        Err(e) => warn!("temp write failed: {e}"),
+        Ok(()) => eprintln!(
+            "  {}  {}   {}",
+            lbl("tmp write"),
+            probe
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            check_ok()
+        ),
+        Err(e) => eprintln!("  {}  {e}   {}", lbl("tmp write"), check_fail()),
     }
+
     Ok(())
 }
 
-// ---------- helpers ----------
+// ---------- structs ----------
 
 struct ServeOpts {
     path: PathBuf,
@@ -335,6 +255,8 @@ struct FetchOpts {
     concurrency: u8,
     verbose: bool,
 }
+
+// ---------- helpers ----------
 
 async fn ingest_blocking(
     path: &Path,
