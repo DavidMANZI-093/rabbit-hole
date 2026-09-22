@@ -15,8 +15,7 @@ const FLAG_MTIME: u16 = 1 << 1;
 const KNOWN_FLAGS: u16 = FLAG_UNIX_MODE | FLAG_MTIME;
 
 pub fn encode(m: &Manifest) -> Vec<u8> {
-    m.validate()
-        .map_err(|e| format!("invalid manifest: {}", e.to_string()));
+    debug_assert!(m.validate().is_ok(), "encode called with invalid manifest");
 
     let mut out = Vec::with_capacity(16 + m.pool.len() * 32);
     out.extend_from_slice(&MAGIC);
@@ -35,6 +34,7 @@ pub fn encode(m: &Manifest) -> Vec<u8> {
     for b in &m.pool {
         out.extend_from_slice(b);
     }
+
     for f in &m.files {
         let pb = f.path.as_bytes();
         encode_uleb(pb.len() as u64, &mut out);

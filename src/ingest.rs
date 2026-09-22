@@ -11,12 +11,12 @@ use crate::{
     fs::{self, FileMeta, FsError, Kind, Op},
     protocol::manifest::{
         FileEntry, Manifest,
-        common::{MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, validate_path},
+        common::{MAX_BLOCK_SIZE, MAX_BLOCKS, MIN_BLOCK_SIZE, validate_path},
     },
     utils::progress::{IngestProgress, Phase, SkipReason},
 };
 
-const WIDTH: usize = 128 * 1024; // 131,072 bytes or ~128KB
+const READ_BUF_SIZE: usize = 128 * 1024;
 
 #[derive(Debug)]
 pub enum IngestError {
@@ -93,27 +93,20 @@ pub fn ingest(
                 let dent = match dent {
                     Ok(d) => d,
                     Err(e) => {
-                        debug!(
-                            "subsequent walk: failed to walk directory with error: {}",
-                            e.to_string()
-                        );
+                        debug!("walk error: {e}");
                         stats.skipped += 1;
                         progress.inc_skipped(SkipReason::WalkError);
                         continue;
                     }
                 };
 
-                // Stage updates are throttled inside, but `set_stage` still
-                // formats; batch here so huge trees don't pay per-dent.
+                // set_stage throttles internally but still allocates; batch every 32 to avoid the cost
                 if i % 32 == 0 {
                     progress.set_stage(Phase::Scan, &dent.path().display().to_string());
                 }
 
                 if dent.file_type().is_symlink() {
-                    debug!(
-                        "subsequent walk: refusing symlink {}",
-                        dent.path().display()
-                    );
+                    debug!("skipping symlink {}", dent.path().display());
                     stats.skipped += 1;
                     progress.inc_skipped(SkipReason::Symlink);
                     continue;
@@ -124,10 +117,7 @@ pub fn ingest(
                     if dent.file_type().is_dir() {
                         continue;
                     }
-                    debug!(
-                        "subsequent walk: not a regular file {}",
-                        dent.path().display()
-                    );
+                    debug!("skipping non-file {}", dent.path().display());
                     stats.skipped += 1;
                     progress.inc_skipped(SkipReason::NonFile);
                     continue;
@@ -137,26 +127,19 @@ pub fn ingest(
                 let size = match fs::metadata(&abs) {
                     Ok(m) => m.size,
                     Err(e) => {
-                        debug!(
-                            "subsequent walk: broken file, invalid size {} with error {}",
-                            dent.path().display(),
-                            e.to_string()
-                        );
+                        debug!("stat failed {}: {e}", dent.path().display());
                         stats.skipped += 1;
                         progress.inc_skipped(SkipReason::StatFailed);
                         continue;
                     }
                 };
                 let rel = abs.strip_prefix(src).map_err(|_| {
-                    IngestError::BadName(format!("path escapess source root: {}", abs.display()))
+                    IngestError::BadName(format!("path outside source root: {}", abs.display()))
                 })?;
                 let rel = match to_manifest_path(rel, &abs) {
                     Ok(r) => r,
                     Err(e) => {
-                        debug!(
-                            "failed to validate for manifest with error {}",
-                            e.to_string()
-                        );
+                        debug!("bad manifest path {}: {e}", abs.display());
                         stats.skipped += 1;
                         progress.inc_skipped(SkipReason::BadName);
                         continue;
@@ -171,7 +154,7 @@ pub fn ingest(
             progress.set_totals(paths.len(), total_bytes);
             progress.set_stage(Phase::Check, "sorting / collision check");
 
-            let rels: Vec<String> = paths.iter().map(|(_, _, r)| r.clone()).collect();
+            let rels: Vec<&str> = paths.iter().map(|(_, _, r)| r.as_str()).collect();
             if let Some((a, b)) = fs::find_case_collision(&rels) {
                 return Err(IngestError::Collision(a, b));
             }
@@ -201,7 +184,7 @@ pub fn ingest(
     };
     manifest
         .validate()
-        .map_err(|e| IngestError::Walk(format!("post-ingest error {}", e.to_string())));
+        .map_err(|e| IngestError::Walk(format!("post-ingest error {e}")))?;
     Ok((manifest, stats))
 }
 
@@ -235,17 +218,17 @@ fn hash_file(
     stats: &mut IngestStats,
     progress: &IngestProgress,
 ) -> Result<FileEntry, IngestError> {
-    let snap_pool = pool.len();
-    let snap_blocks = stats.blocks_total;
-    let snap_bytes = stats.bytes;
+    let saved_pool_len = pool.len();
+    let saved_blocks_total = stats.blocks_total;
+    let saved_bytes = stats.bytes;
 
     match hash_file_inner(abs, rel, meta, block_size, pool, index, stats, progress) {
         Ok(e) => Ok(e),
         Err(err) => {
-            pool.truncate(snap_pool);
-            index.retain(|_, id| (*id as usize) < snap_pool);
-            stats.blocks_total = snap_blocks;
-            stats.bytes = snap_bytes;
+            pool.truncate(saved_pool_len);
+            index.retain(|_, id| (*id as usize) < saved_pool_len);
+            stats.blocks_total = saved_blocks_total;
+            stats.bytes = saved_bytes;
             Err(err)
         }
     }
@@ -264,11 +247,11 @@ fn hash_file_inner(
     let bs = block_size as u64;
     let mut chunks: Vec<u32> = Vec::new();
     if meta.size > 0 {
-        chunks.reserve(meta.size.div_ceil(bs).min(MAX_BLOCK_SIZE.into()) as usize);
+        chunks.reserve(meta.size.div_ceil(bs).min(MAX_BLOCKS as u64) as usize);
 
         let mut f =
             File::open(abs).map_err(|e| IngestError::Fs(fs::map_io(abs, fs::Op::Read, e)))?;
-        let mut buffer = vec![0u8; WIDTH];
+        let mut buffer = vec![0u8; READ_BUF_SIZE];
         let mut hasher = blake3::Hasher::new();
         let mut in_block: u64 = 0;
 

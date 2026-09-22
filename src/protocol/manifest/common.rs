@@ -61,12 +61,10 @@ impl std::fmt::Display for ManifestError {
     }
 }
 
-// impl std::error::Error for ManifestError {}
+impl std::error::Error for ManifestError {}
 
-// ---------- unsigned LEB128 variable-length compression ----------
-//
-// 7 payload bits per byte plus one continuation bit.
-// Minimal-length form is mandatory on decode.
+// ---------- unsigned LEB128 ----------
+// 7 payload bits per byte, continuation at msb; minimal-length form required on decode
 
 pub fn encode_uleb(mut v: u64, out: &mut Vec<u8>) {
     loop {
@@ -248,4 +246,146 @@ pub fn hex_encode(b: &[u8]) -> String {
         s.push(H[(x & 15) as usize] as char);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- validate_path ---
+
+    #[test]
+    fn empty_path_is_rejected() {
+        assert!(validate_path("").is_err());
+    }
+
+    #[test]
+    fn leading_slash_is_rejected() {
+        assert!(validate_path("/foo/bar").is_err());
+    }
+
+    #[test]
+    fn trailing_slash_is_rejected() {
+        assert!(validate_path("foo/bar/").is_err());
+    }
+
+    #[test]
+    fn double_slash_is_rejected() {
+        assert!(validate_path("foo//bar").is_err());
+    }
+
+    #[test]
+    fn dot_component_is_rejected() {
+        assert!(validate_path("foo/./bar").is_err());
+    }
+
+    #[test]
+    fn dotdot_component_is_rejected() {
+        assert!(validate_path("foo/../bar").is_err());
+    }
+
+    #[test]
+    fn null_byte_is_rejected() {
+        assert!(validate_path("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn simple_filename_is_accepted() {
+        assert!(validate_path("hello.txt").is_ok());
+    }
+
+    #[test]
+    fn nested_path_is_accepted() {
+        assert!(validate_path("a/b/c/d.txt").is_ok());
+    }
+
+    // --- expected_chunks ---
+
+    #[test]
+    fn zero_size_has_no_chunks() {
+        assert_eq!(expected_chunks(0, 1024), 0);
+    }
+
+    #[test]
+    fn exact_block_size_is_one_chunk() {
+        assert_eq!(expected_chunks(4096, 4096), 1);
+    }
+
+    #[test]
+    fn one_byte_over_block_size_is_two_chunks() {
+        assert_eq!(expected_chunks(4097, 4096), 2);
+    }
+
+    #[test]
+    fn large_file_chunk_count_is_correct() {
+        let size = 10 * 1024 * 1024u64; // 10 MiB
+        let bs = 1024 * 1024u32;        // 1 MiB
+        assert_eq!(expected_chunks(size, bs), 10);
+    }
+
+    // --- hex encode / decode ---
+
+    #[test]
+    fn hex_roundtrip_all_zeros() {
+        let bytes = [0u8; 32];
+        let encoded = hex_encode(&bytes);
+        assert_eq!(encoded, "0".repeat(64));
+        assert_eq!(hex_decode32(&encoded).unwrap(), bytes);
+    }
+
+    #[test]
+    fn hex_roundtrip_all_ones() {
+        let bytes = [0xffu8; 32];
+        let encoded = hex_encode(&bytes);
+        assert_eq!(encoded, "ff".repeat(32));
+        assert_eq!(hex_decode32(&encoded).unwrap(), bytes);
+    }
+
+    #[test]
+    fn hex_decode_rejects_wrong_length() {
+        assert!(hex_decode32("abc").is_err());
+        assert!(hex_decode32(&"a".repeat(63)).is_err());
+        assert!(hex_decode32(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn hex_decode_rejects_invalid_digit() {
+        let bad = "g".repeat(64);
+        assert!(hex_decode32(&bad).is_err());
+    }
+
+    // --- uleb128 roundtrip ---
+
+    fn uleb_roundtrip(v: u64) -> u64 {
+        let mut buf = Vec::new();
+        encode_uleb(v, &mut buf);
+        Reader::new(&buf).uleb().expect("decode failed")
+    }
+
+    #[test]
+    fn uleb_zero_roundtrips() {
+        assert_eq!(uleb_roundtrip(0), 0);
+    }
+
+    #[test]
+    fn uleb_127_roundtrips() {
+        assert_eq!(uleb_roundtrip(127), 127);
+    }
+
+    #[test]
+    fn uleb_128_roundtrips() {
+        assert_eq!(uleb_roundtrip(128), 128);
+    }
+
+    #[test]
+    fn uleb_max_u64_roundtrips() {
+        assert_eq!(uleb_roundtrip(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn non_canonical_uleb_is_rejected() {
+        // 0x00 encoded as two bytes (0x80, 0x00) is non-canonical
+        let non_canonical = vec![0x80u8, 0x00];
+        assert!(Reader::new(&non_canonical).uleb().is_err());
+    }
 }

@@ -10,7 +10,7 @@ pub mod v1;
 // per the support policy (current + previous).
 pub const CURRENT: u16 = 1;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FileEntry {
     pub path: String,
     pub size: u64,
@@ -19,7 +19,7 @@ pub struct FileEntry {
     pub chunks: Vec<u32>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Manifest {
     pub block_size: u32,
     pub pool: Vec<[u8; 32]>,
@@ -109,4 +109,129 @@ pub fn peek_version(input: &[u8]) -> Result<u16, common::ManifestError> {
         return Err(common::ManifestError::Truncated { at: 4, need: 2 });
     }
     Ok(u16::from_le_bytes([input[4], input[5]]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE;
+
+    fn make_hash(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    #[test]
+    fn empty_manifest_roundtrips() {
+        let m = Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            pool: vec![],
+            files: vec![],
+        };
+        let encoded = encode(&m);
+        let decoded = decode(&encoded).expect("decode failed");
+        assert_eq!(m, decoded);
+    }
+
+    #[test]
+    fn single_file_no_metadata_roundtrips() {
+        let hash = make_hash(1);
+        let m = Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            pool: vec![hash],
+            files: vec![FileEntry {
+                path: "hello.txt".to_string(),
+                size: DEFAULT_BLOCK_SIZE as u64,
+                mode: None,
+                mtime_ns: None,
+                chunks: vec![0],
+            }],
+        };
+        let encoded = encode(&m);
+        let decoded = decode(&encoded).expect("decode failed");
+        assert_eq!(m, decoded);
+    }
+
+    #[test]
+    fn single_file_with_mode_and_mtime_roundtrips() {
+        let hash = make_hash(2);
+        let m = Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            pool: vec![hash],
+            files: vec![FileEntry {
+                path: "script.sh".to_string(),
+                size: DEFAULT_BLOCK_SIZE as u64,
+                mode: Some(0o755),
+                mtime_ns: Some(1_700_000_000_000_000_000),
+                chunks: vec![0],
+            }],
+        };
+        let encoded = encode(&m);
+        let decoded = decode(&encoded).expect("decode failed");
+        assert_eq!(m, decoded);
+    }
+
+    #[test]
+    fn multifile_with_shared_block_roundtrips() {
+        let hash = make_hash(3);
+        let m = Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            pool: vec![hash],
+            files: vec![
+                FileEntry {
+                    path: "a/foo.bin".to_string(),
+                    size: DEFAULT_BLOCK_SIZE as u64,
+                    mode: None,
+                    mtime_ns: None,
+                    chunks: vec![0],
+                },
+                FileEntry {
+                    path: "b/foo.bin".to_string(),
+                    size: DEFAULT_BLOCK_SIZE as u64,
+                    mode: None,
+                    mtime_ns: None,
+                    chunks: vec![0], // same block — dedup
+                },
+            ],
+        };
+        let encoded = encode(&m);
+        let decoded = decode(&encoded).expect("decode failed");
+        assert_eq!(m, decoded);
+    }
+
+    #[test]
+    fn negative_mtime_roundtrips() {
+        let hash = make_hash(4);
+        let m = Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            pool: vec![hash],
+            files: vec![FileEntry {
+                path: "old.txt".to_string(),
+                size: DEFAULT_BLOCK_SIZE as u64,
+                mode: None,
+                mtime_ns: Some(-1_000_000_000),
+                chunks: vec![0],
+            }],
+        };
+        let encoded = encode(&m);
+        let decoded = decode(&encoded).expect("decode failed");
+        assert_eq!(m, decoded);
+    }
+
+    #[test]
+    fn bad_magic_is_rejected() {
+        let mut bad = vec![0u8; 16];
+        bad[0] = b'X';
+        assert!(decode(&bad).is_err());
+    }
+
+    #[test]
+    fn truncated_input_is_rejected() {
+        let m = Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            pool: vec![],
+            files: vec![],
+        };
+        let full = encode(&m);
+        assert!(decode(&full[..full.len() - 1]).is_err());
+    }
 }

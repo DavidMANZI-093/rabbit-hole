@@ -1,4 +1,4 @@
-use std::{clone, collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use reqwest::Client;
 
@@ -62,17 +62,17 @@ pub async fn fetch(
         out_files.push(Arc::new(file));
     }
 
-    let mut stage: HashMap<[u8; 32], Vec<(usize, u64)>> = HashMap::new();
+    let mut block_targets: HashMap<[u8; 32], Vec<(usize, u64)>> = HashMap::new();
     let bs = manifest.block_size as u64;
     for (fi, f) in manifest.files.iter().enumerate() {
         for (j, idx) in f.chunks.iter().enumerate() {
             let digest = manifest.pool[*idx as usize];
             let offset = j as u64 * bs;
-            stage.entry(digest).or_default().push((fi, offset));
+            block_targets.entry(digest).or_default().push((fi, offset));
         }
     }
 
-    let n_unique = stage.len();
+    let n_unique = block_targets.len();
     let bytes_total: u64 = manifest.files.iter().map(|f| f.size).sum();
 
     info!(
@@ -105,7 +105,7 @@ pub async fn fetch(
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1) as usize));
     let mut tasks = Vec::with_capacity(n_unique);
 
-    for (digest, locs) in stage {
+    for (digest, locs) in block_targets {
         let files = out_files.clone();
         let token = bearer.clone();
         let client = client.clone();
@@ -284,9 +284,10 @@ pub async fn pull_manifest(
         }
         if attempt <= RETRIES {
             error!(
-                "manifest: not reachable (attemp {attempt}/{}), retrying...",
+                "manifest: not reachable (attempt {attempt}/{}), retrying...",
                 RETRIES + 1
             );
+            // manifest retries use 5×attempt delays (5s/10s/15s) — cold edge routes need longer warm-up
             tokio::time::sleep(Duration::from_secs(5 * attempt as u64)).await;
         }
     }

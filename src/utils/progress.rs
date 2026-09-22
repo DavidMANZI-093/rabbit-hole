@@ -234,9 +234,11 @@ pub fn format_bytes(n: u64) -> String {
     }
 }
 
-fn truncate_path(p: &str) -> String {
+use std::borrow::Cow;
+
+fn truncate_path(p: &str) -> Cow<'_, str> {
     if p.len() <= MAX_PATH_WIDTH {
-        return p.to_string();
+        return Cow::Borrowed(p);
     }
     let tail_len = MAX_PATH_WIDTH - 3;
     let start = p.len() - tail_len;
@@ -244,7 +246,7 @@ fn truncate_path(p: &str) -> String {
     while i < p.len() && !p.is_char_boundary(i) {
         i += 1;
     }
-    format!("...{}", &p[i.min(p.len())..])
+    Cow::Owned(format!("...{}", &p[i.min(p.len())..]))
 }
 
 // ---------- fetch ----------
@@ -252,11 +254,13 @@ fn truncate_path(p: &str) -> String {
 const BAR_CELLS: &str = "#..";
 const SLOT_BAR_WIDTH: usize = 12;
 
+#[derive(Debug)]
 struct FetchFile {
     name: String,
     size: u64,
 }
 
+#[derive(Debug)]
 struct FetchState {
     slots: Vec<ProgressBar>,
     summary: ProgressBar,
@@ -268,6 +272,7 @@ struct FetchState {
     speed_bytes: u64,
 }
 
+#[derive(Debug)]
 struct FetchInner {
     mp: MultiProgress,
     slots_n: usize,
@@ -280,7 +285,7 @@ struct FetchInner {
     failed: AtomicU64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FetchProgress {
     inner: Arc<FetchInner>,
 }
@@ -386,8 +391,7 @@ impl FetchProgress {
             .unwrap_or(0)
     }
 
-    /// Add `n` bytes to a file's fill counter, clamped to its size.
-    /// Returns the new clamped total.
+    // clamped to file size; returns new total
     pub fn add_file_bytes(&self, fi: usize, n: u64) -> u64 {
         let guard = self.inner.state.lock().expect("fetch state lock");
         let Some(st) = guard.as_ref() else { return 0 };
@@ -416,7 +420,7 @@ impl FetchProgress {
             .files
             .get(fi)
             .map(|f| truncate_path(&f.name))
-            .unwrap_or_else(|| "?".to_string());
+            .unwrap_or_else(|| Cow::Owned("?".to_string()));
         format!("[{}/{}] {name}", slot + 1, st.slots.len())
     }
 

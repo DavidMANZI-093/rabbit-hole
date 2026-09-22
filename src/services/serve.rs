@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io::SeekFrom,
-    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -48,7 +47,7 @@ pub struct Shared {
     pub manifest_bytes: Vec<u8>,
     pub etag: String,
     pub kind: Kind,
-    pub blocks: HashMap<[u8; 32], Vec<Locator>>,
+    pub blocks: HashMap<[u8; 32], Arc<Vec<Locator>>>,
     pub token: Option<String>,
 }
 
@@ -62,7 +61,7 @@ pub fn build_shared(
     let bs = manifest.block_size as u64;
     let single = src.is_file();
 
-    let mut blocks: HashMap<[u8; 32], Vec<Locator>> = HashMap::new();
+    let mut blocks_build: HashMap<[u8; 32], Vec<Locator>> = HashMap::new();
     for f in &manifest.files {
         let abs = if single {
             src.to_path_buf()
@@ -75,13 +74,17 @@ pub fn build_shared(
             let offset = j as u64 * bs;
             let len = bs.min(f.size.saturating_sub(offset)) as u32;
 
-            blocks.entry(digest).or_default().push(Locator {
+            blocks_build.entry(digest).or_default().push(Locator {
                 abs: abs.clone(),
                 offset,
                 len,
             });
         }
     }
+    let blocks: HashMap<[u8; 32], Arc<Vec<Locator>>> = blocks_build
+        .into_iter()
+        .map(|(k, v)| (k, Arc::new(v)))
+        .collect();
 
     let kind = if single {
         let entry = manifest
@@ -293,7 +296,7 @@ async fn h_block(
     let Some(cands) = s.blocks.get(&want) else {
         return (StatusCode::NOT_FOUND, "unknown block\n").into_response();
     };
-    let cands = cands.clone();
+    let cands = cands.clone(); // Arc clone — O(1)
     match tokio::task::spawn_blocking(move || read_verified_block(&want, &cands)).await {
         Ok(Ok(bytes)) => Response::builder()
             .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -321,7 +324,7 @@ fn read_verified_block(want: &[u8; 32], cands: &[Locator]) -> Result<Vec<u8>, St
         let mut buf = vec![0u8; loc.len as usize];
         let mut off = 0;
         while off < buf.len() {
-            match f.read_at(&mut buf[off..], loc.offset + off as u64) {
+            match crate::fs::read_at(&f, &mut buf[off..], loc.offset + off as u64) {
                 Ok(0) => break,
                 Ok(n) => off += n,
                 Err(_) => break,
@@ -377,14 +380,14 @@ fn render_tree(s: &Shared, prefix: &str, q: &HashMap<String, String>) -> Html<St
         ));
     }
 
-    let mut h = String::new();
-    h.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
-    h.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
-    h.push_str("<title>rabbit-hole</title>");
-    h.push_str("<style>body{font-family:monospace;max-width:60em;margin:2em auto;padding:0 1em}li{margin:.2em 0}.banner{border:1px dashed #888;padding:.6em;margin-bottom:1em}</style>");
-    h.push_str("</head><body>");
-    h.push_str("<div class=\"banner\">Full folder sync + verified transfer: install <b>rh</b> and run <code>rh fetch &lt;code-or-URL&gt; &lt;dest&gt;</code></div>");
-    h.push_str(&format!(
+    let mut html = String::new();
+    html.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    html.push_str("<title>rabbit-hole</title>");
+    html.push_str("<style>body{font-family:monospace;max-width:60em;margin:2em auto;padding:0 1em}li{margin:.2em 0}.banner{border:1px dashed #888;padding:.6em;margin-bottom:1em}</style>");
+    html.push_str("</head><body>");
+    html.push_str("<div class=\"banner\">Full folder sync + verified transfer: install <b>rh</b> and run <code>rh fetch &lt;code-or-URL&gt; &lt;dest&gt;</code></div>");
+    html.push_str(&format!(
         "<h1>{}</h1><ul>",
         html_escape(if prefix.is_empty() { "/" } else { prefix })
     ));
@@ -396,18 +399,18 @@ fn render_tree(s: &Shared, prefix: &str, q: &HashMap<String, String>) -> Html<St
         } else {
             format!("/__rh__/tree/{parent}{qs}")
         };
-        h.push_str(&format!("<li><a href=\"{up}\">..</a></li>"));
+        html.push_str(&format!("<li><a href=\"{up}\">..</a></li>"));
     }
 
-    for (d, (n, bytes)) in &dirs {
+    for (dir_name, (file_count, bytes)) in &dirs {
         let href = if prefix.is_empty() {
-            format!("/__rh__/tree/{d}{qs}")
+            format!("/__rh__/tree/{dir_name}{qs}")
         } else {
-            format!("/__rh__/tree/{prefix}/{d}{qs}")
+            format!("/__rh__/tree/{prefix}/{dir_name}{qs}")
         };
-        h.push_str(&format!(
-            "<li>[dir] <a href=\"{href}\">{}</a> ({n} files, {bytes} B)</li>",
-            html_escape(d)
+        html.push_str(&format!(
+            "<li>[dir] <a href=\"{href}\">{}</a> ({file_count} files, {bytes} B)</li>",
+            html_escape(dir_name)
         ));
     }
 
@@ -419,14 +422,14 @@ fn render_tree(s: &Shared, prefix: &str, q: &HashMap<String, String>) -> Html<St
         } else {
             format!("{prefix}/{name}")
         };
-        h.push_str(&format!(
+        html.push_str(&format!(
             "<li><a href=\"/__rh__/f/{rel}{qs}\">{}</a> ({size} B)</li>",
             html_escape(name)
         ));
     }
-    h.push_str("</ul></body></html>");
+    html.push_str("</ul></body></html>");
 
-    Html(h)
+    Html(html)
 }
 
 fn pass_query(token: Option<&str>, q: &HashMap<String, String>) -> String {
@@ -440,19 +443,11 @@ fn pass_query(token: Option<&str>, q: &HashMap<String, String>) -> String {
 
 // ---------- auth ----------
 
-// 32 random bytes as lowercase hex. CSPRNG via `rand`; fixed width keeps
-// parsing trivial.
+// 32 CSPRNG bytes as fixed 64-char hex — fixed width keeps parsing trivial
 pub fn generate_token() -> String {
-    // TODO: Bench and optimize with SIMD
     let mut buf = [0u8; 32];
     rand::rng().fill_bytes(&mut buf);
-
-    let mut s = String::with_capacity(64);
-    for b in buf {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((b & 15) as u32, 16).unwrap());
-    }
-    s
+    crate::protocol::manifest::common::hex_encode(&buf)
 }
 
 fn query_ok(q: &HashMap<String, String>, expected: Option<&str>) -> bool {
@@ -533,7 +528,6 @@ fn html_escape(s: &str) -> String {
     o
 }
 
-// #[derive(Debug, PartialEq)]
 struct Wanted {
     start: u64,
     end: u64,
@@ -656,4 +650,109 @@ fn sanitize_filename(n: &str) -> String {
         })
         .take(128)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_range ---
+
+    fn parse(h: Option<&str>, total: u64) -> Result<Option<Wanted>, axum::http::StatusCode> {
+        parse_range(h, total)
+    }
+
+    #[test]
+    fn no_range_header_returns_none() {
+        assert!(parse(None, 1000).unwrap().is_none());
+    }
+
+    #[test]
+    fn full_range_returns_none() {
+        assert!(parse(Some("bytes=0-999"), 1000).unwrap().is_some());
+        let w = parse(Some("bytes=0-999"), 1000).unwrap().unwrap();
+        assert_eq!(w.start, 0);
+        assert_eq!(w.end, 999);
+    }
+
+    #[test]
+    fn open_ended_range_reaches_last_byte() {
+        let w = parse(Some("bytes=500-"), 1000).unwrap().unwrap();
+        assert_eq!(w.start, 500);
+        assert_eq!(w.end, 999);
+    }
+
+    #[test]
+    fn suffix_range_counts_from_end() {
+        let w = parse(Some("bytes=-100"), 1000).unwrap().unwrap();
+        assert_eq!(w.start, 900);
+        assert_eq!(w.end, 999);
+    }
+
+    #[test]
+    fn start_beyond_file_size_is_unsatisfiable() {
+        assert!(parse(Some("bytes=1000-"), 1000).is_err());
+    }
+
+    #[test]
+    fn end_before_start_is_unsatisfiable() {
+        assert!(parse(Some("bytes=500-100"), 1000).is_err());
+    }
+
+    #[test]
+    fn range_on_empty_file_is_unsatisfiable() {
+        assert!(parse(Some("bytes=0-0"), 0).is_err());
+    }
+
+    // --- ct_eq ---
+
+    #[test]
+    fn identical_strings_are_equal() {
+        assert!(ct_eq("abc", "abc"));
+    }
+
+    #[test]
+    fn same_length_different_content_is_not_equal() {
+        assert!(!ct_eq("abc", "abd"));
+    }
+
+    #[test]
+    fn different_lengths_are_not_equal() {
+        assert!(!ct_eq("abc", "abcd"));
+    }
+
+    // --- html_escape ---
+
+    #[test]
+    fn html_special_chars_are_escaped() {
+        assert_eq!(html_escape("<a>&\"b"), "&lt;a&gt;&amp;&quot;b");
+    }
+
+    #[test]
+    fn plain_text_passes_through_unchanged() {
+        assert_eq!(html_escape("hello world"), "hello world");
+    }
+
+    // --- sanitize_filename ---
+
+    #[test]
+    fn control_chars_become_underscores() {
+        assert_eq!(sanitize_filename("foo\x00bar"), "foo_bar");
+    }
+
+    #[test]
+    fn quotes_and_backslashes_become_underscores() {
+        assert_eq!(sanitize_filename("foo\"bar\\baz"), "foo_bar_baz");
+    }
+
+    #[test]
+    fn normal_filename_passes_through() {
+        assert_eq!(sanitize_filename("hello world.txt"), "hello world.txt");
+    }
+
+    #[test]
+    fn long_filename_is_truncated_to_128_chars() {
+        let long = "a".repeat(200);
+        assert_eq!(sanitize_filename(&long).len(), 128);
+    }
 }

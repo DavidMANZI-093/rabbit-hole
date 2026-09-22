@@ -93,10 +93,7 @@ pub struct FileMeta {
     pub mtime_ns: Option<i64>,
 }
 
-// Uses `lstat` behavior: symlinks are reported, never followed.
-// Prevents directory traversal attacks where recursive walks expose
-// sensitive files. Following must be an explicit decision inferred
-// from a hard tree.
+// lstat: never follows symlinks — callers decide if following is safe
 pub fn metadata(path: &Path) -> Result<FileMeta, FsError> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| map_io(path, Op::Stat, e))?;
     let kind = if meta.is_symlink() {
@@ -123,8 +120,6 @@ fn unix_mode(meta: &std::fs::Metadata) -> Option<u32> {
     Some(meta.permissions().mode() & 0o7777)
 }
 
-// `mode` is unix-only. `None` is returned on other platforms
-// signaling omittion.
 #[cfg(not(unix))]
 fn unix_mode(_meta: &std::fs::Metadata) -> Option<u32> {
     None
@@ -138,14 +133,12 @@ fn mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
         .and_then(|d| i64::try_from(d.as_nanos()).ok())
 }
 
-// Ensures concurrent `pwrite` allocations don't scatter causing fragmentation,
-// fewer fs metadata inquiries, space availability, and true parallelism.
+// preallocate avoids fragmentation and ensures space before concurrent pwrite callers begin
 pub fn preallocate(f: &File, size: u64) -> Result<(), FsError> {
     f.set_len(size).map_err(FsError::Other)
 }
 
-// `mtime` failures and `chmod` failures return `Err`; leniency remains call-site's
-// policy, not this layer's.
+// failures are returned; call-site decides whether to warn or abort
 pub fn apply_metadata(
     path: &Path,
     mode: Option<u32>,
@@ -158,7 +151,7 @@ pub fn apply_metadata(
             .map_err(|e| map_io(path, Op::SetMeta, e))?;
     }
     #[cfg(not(unix))]
-    let _ = mode; // inapplicable: no mode bits to restore
+    let _ = mode;
     if let Some(ns) = mtime_ns
         && let Some(st) = system_time_from_ns(ns)
     {
@@ -182,7 +175,32 @@ pub fn system_time_from_ns(ns: i64) -> Option<SystemTime> {
 
 // ---------- positional I/O ----------
 
-// `pwrite` equivalent. Same platform notes as above, [`read_at`].
+// surfaces write errors that would otherwise only appear on close
+pub fn sync(f: &File) -> Result<(), FsError> {
+    f.sync_all().map_err(FsError::Other)
+}
+
+pub fn read_at(f: &File, buf: &mut [u8], offset: u64) -> Result<usize, FsError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.read_at(buf, offset).map_err(FsError::Other)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        f.seek_read(buf, offset).map_err(FsError::Other)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (f, buf, offset);
+        Err(FsError::Other(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "positional reads need unix or windows",
+        )))
+    }
+}
+
 pub fn write_at(f: &File, buf: &[u8], offset: u64) -> Result<usize, FsError> {
     #[cfg(unix)]
     {
@@ -204,31 +222,21 @@ pub fn write_at(f: &File, buf: &[u8], offset: u64) -> Result<usize, FsError> {
     }
 }
 
-// Ensures handling of errors that would otherwise only be caught
-// when the `File` is closed,
-pub fn sync(f: &File) -> Result<(), FsError> {
-    f.sync_all().map_err(FsError::Other)
-}
+// ---------- path helpers ----------
 
-// ---------- path helpers for ingest ----------
-
-// Case-insensitive duplicate detector. Returns the first colliding pair.
-// Windows/macOS filesystems would silently merge these on fetch.
-// Ingest must hard-error instead.
-pub fn find_case_collision(paths: &[String]) -> Option<(String, String)> {
-    let mut seen: std::collections::HashMap<String, &String> = std::collections::HashMap::new();
-    for p in paths {
-        let folded = p.to_lowercase();
-        if let Some(prev) = seen.insert(folded, p) {
-            return Some((prev.clone(), p.clone()));
+// windows/macOS would silently merge case-variant names — hard-error instead
+pub fn find_case_collision<S: AsRef<str>>(paths: &[S]) -> Option<(String, String)> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, p) in paths.iter().enumerate() {
+        let folded = p.as_ref().to_lowercase();
+        if let Some(prev_i) = seen.insert(folded, i) {
+            return Some((paths[prev_i].as_ref().to_string(), p.as_ref().to_string()));
         }
     }
     None
 }
 
-// Relative path -> `/`-separated UTF-8 form for the manifest.
-// `None` means unrepresentable (non-UTF8, absolute, `..`, empty) and
-// call-site skips it under its leniency policy.
+// None for non-UTF-8, absolute, .., or empty paths — caller skips
 pub fn rel_to_unix(rel: &Path) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for comp in rel.components() {
@@ -240,6 +248,93 @@ pub fn rel_to_unix(rel: &Path) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
-
     Some(parts.join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- find_case_collision ---
+
+    #[test]
+    fn no_collision_on_empty_input() {
+        let paths: Vec<&str> = vec![];
+        assert!(find_case_collision(&paths).is_none());
+    }
+
+    #[test]
+    fn no_collision_on_distinct_names() {
+        let paths = vec!["foo/bar.txt", "foo/baz.txt", "other/qux.rs"];
+        assert!(find_case_collision(&paths).is_none());
+    }
+
+    #[test]
+    fn collision_detected_for_exact_duplicate() {
+        let paths = vec!["foo/bar.txt", "foo/bar.txt"];
+        assert!(find_case_collision(&paths).is_some());
+    }
+
+    #[test]
+    fn collision_detected_for_case_variant() {
+        let paths = vec!["foo/Bar.txt", "foo/bar.txt"];
+        assert!(find_case_collision(&paths).is_some());
+    }
+
+    #[test]
+    fn collision_works_with_owned_strings() {
+        let paths: Vec<String> = vec!["Readme.md".to_string(), "README.md".to_string()];
+        assert!(find_case_collision(&paths).is_some());
+    }
+
+    // --- rel_to_unix ---
+
+    #[test]
+    fn simple_filename_converts_unchanged() {
+        assert_eq!(rel_to_unix(Path::new("foo.txt")), Some("foo.txt".to_string()));
+    }
+
+    #[test]
+    fn nested_path_uses_forward_slashes() {
+        assert_eq!(
+            rel_to_unix(Path::new("a/b/c.txt")),
+            Some("a/b/c.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn dotdot_component_returns_none() {
+        assert_eq!(rel_to_unix(Path::new("a/../b.txt")), None);
+    }
+
+    #[test]
+    fn absolute_path_returns_none() {
+        assert_eq!(rel_to_unix(Path::new("/etc/passwd")), None);
+    }
+
+    #[test]
+    fn empty_path_returns_none() {
+        assert_eq!(rel_to_unix(Path::new("")), None);
+    }
+
+    // --- system_time_from_ns ---
+
+    #[test]
+    fn positive_ns_is_after_epoch() {
+        let t = system_time_from_ns(1_000_000_000);
+        assert!(t.is_some());
+        assert!(t.unwrap() > UNIX_EPOCH);
+    }
+
+    #[test]
+    fn zero_ns_is_the_epoch() {
+        assert_eq!(system_time_from_ns(0), Some(UNIX_EPOCH));
+    }
+
+    #[test]
+    fn negative_ns_is_before_epoch() {
+        let t = system_time_from_ns(-1_000_000_000);
+        assert!(t.is_some());
+        assert!(t.unwrap() < UNIX_EPOCH);
+    }
 }
