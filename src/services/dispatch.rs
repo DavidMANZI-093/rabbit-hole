@@ -60,7 +60,10 @@ pub async fn run(cmd: Cmd) -> Result<(), String> {
             })
             .await
         }
-        Cmd::Check => run_check().await,
+        Cmd::Check { no_color } => {
+            log::init_color(no_color);
+            run_check().await
+        }
     }
 }
 

@@ -48,5 +48,8 @@ pub enum Cmd {
         #[arg(long, short)]
         verbose: bool,
     },
-    Check,
+    Check {
+        #[arg(long)]
+        no_color: bool,
+    },
 }

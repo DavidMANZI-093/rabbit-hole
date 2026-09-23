@@ -72,7 +72,7 @@ pub fn red(s: &str) -> String {
 // U+2713 CHECK MARK on TTY, plain "ok" otherwise.
 pub fn check_ok() -> String {
     if is_color() {
-        green("✓")
+        green("\u{2714}")
     } else {
         "ok".to_string()
     }
@@ -81,7 +81,7 @@ pub fn check_ok() -> String {
 // U+2717 BALLOT X on TTY, plain "fail" otherwise.
 pub fn check_fail() -> String {
     if is_color() {
-        red("✗")
+        red("\u{2716}")
     } else {
         "fail".to_string()
     }
