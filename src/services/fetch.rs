@@ -353,3 +353,102 @@ async fn fetch_block(
         s => Err(format!("block {hex}: edge returned {s}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- normalize_base ---
+
+    #[test]
+    fn strips_trailing_slash_from_https_url() {
+        assert_eq!(
+            normalize_base("https://example.com/").unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn strips_multiple_trailing_slashes() {
+        assert_eq!(
+            normalize_base("https://example.com///").unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn accepts_http_scheme() {
+        assert_eq!(
+            normalize_base("http://localhost:8080").unwrap(),
+            "http://localhost:8080"
+        );
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace() {
+        assert_eq!(
+            normalize_base("  https://example.com  ").unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_scheme() {
+        assert!(normalize_base("example.com").is_err());
+    }
+
+    #[test]
+    fn rejects_ftp_scheme() {
+        assert!(normalize_base("ftp://example.com").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_string() {
+        assert!(normalize_base("").is_err());
+    }
+
+    // --- prepare_dest ---
+
+    #[test]
+    fn creates_missing_directory() {
+        let dir = std::env::temp_dir().join(format!("rh-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(prepare_dest(&dir, false).is_ok());
+        assert!(dir.is_dir());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn accepts_existing_empty_directory() {
+        let dir = std::env::temp_dir().join(format!("rh-test-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(prepare_dest(&dir, false).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_non_empty_directory_without_force() {
+        let dir = std::env::temp_dir().join(format!("rh-test-nonempty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file.txt"), b"data").unwrap();
+        assert!(prepare_dest(&dir, false).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn accepts_non_empty_directory_with_force() {
+        let dir = std::env::temp_dir().join(format!("rh-test-force-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file.txt"), b"data").unwrap();
+        assert!(prepare_dest(&dir, true).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_dest_that_is_a_file() {
+        let file = std::env::temp_dir().join(format!("rh-test-file-{}", std::process::id()));
+        std::fs::write(&file, b"data").unwrap();
+        assert!(prepare_dest(&file, false).is_err());
+        std::fs::remove_file(&file).ok();
+    }
+}

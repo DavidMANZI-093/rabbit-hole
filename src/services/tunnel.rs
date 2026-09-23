@@ -13,6 +13,7 @@ use crate::{utils::ui::prettify, warn};
 
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(45);
+
 // the "Registered tunnel connection ... protocol=quic" line appears within milliseconds
 // of the URL line — 600ms is generous but cheap to wait
 const PROTOCOL_PEEK: Duration = Duration::from_millis(600);
@@ -23,7 +24,7 @@ pub async fn spawn(port: u16) -> Result<Tunnel, String> {
     cmd.args([
         "tunnel",
         "--no-autoupdate",
-        "--no-prechecks", // skip post-connection diagnostic table (~6s we don't need)
+        "--no-prechecks", // skip post-connection diagnostic table (~6s wasted otherwise)
         "--metrics",
         "localhost:0", // random port — avoids conflicts with existing instances
         "--url",
@@ -202,4 +203,97 @@ fn sniff_protocol(line: &str) -> Option<String> {
         .unwrap_or(rest.len());
     let proto = &rest[..end];
     matches!(proto, "quic" | "http2" | "http3").then(|| proto.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- sniff_url ---
+
+    #[test]
+    fn extracts_url_from_cloudflared_box_line() {
+        let line = "2026-09-22T06:40:14Z INF |  https://auckland-contacting-ensure-enhanced.trycloudflare.com  |";
+        assert_eq!(
+            sniff_url(line),
+            Some("https://auckland-contacting-ensure-enhanced.trycloudflare.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_url_from_bare_log_line() {
+        let line = "Visit it at https://foo-bar-baz.trycloudflare.com and enjoy";
+        assert_eq!(
+            sniff_url(line),
+            Some("https://foo-bar-baz.trycloudflare.com".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_http_scheme() {
+        // cloudflared always uses https; plain http must not be accepted
+        let line = "http://foo-bar-baz.trycloudflare.com";
+        assert_eq!(sniff_url(line), None);
+    }
+
+    #[test]
+    fn rejects_non_trycloudflare_domain() {
+        let line = "https://example.com";
+        assert_eq!(sniff_url(line), None);
+    }
+
+    #[test]
+    fn rejects_bare_trycloudflare_domain_without_subdomain() {
+        // "https://trycloudflare.com" has no label before the suffix — must reject
+        let line = "https://trycloudflare.com";
+        assert_eq!(sniff_url(line), None);
+    }
+
+    #[test]
+    fn rejects_url_with_path() {
+        // cloudflared prints only the hostname, never a path
+        let line = "https://foo.trycloudflare.com/some/path";
+        assert_eq!(sniff_url(line), None);
+    }
+
+    #[test]
+    fn stops_at_whitespace() {
+        let line = "https://my-tunnel.trycloudflare.com is now live";
+        assert_eq!(
+            sniff_url(line),
+            Some("https://my-tunnel.trycloudflare.com".to_string())
+        );
+    }
+
+    // --- sniff_protocol ---
+
+    #[test]
+    fn extracts_quic_protocol() {
+        let line = "2026-09-22T06:40:16Z INF Registered tunnel connection connIndex=0 connection=abc event=0 ip=1.2.3.4 location=nbo04 protocol=quic";
+        assert_eq!(sniff_protocol(line), Some("quic".to_string()));
+    }
+
+    #[test]
+    fn extracts_http2_protocol() {
+        let line = "Registered tunnel connection protocol=http2 connIndex=0";
+        assert_eq!(sniff_protocol(line), Some("http2".to_string()));
+    }
+
+    #[test]
+    fn rejects_unknown_protocol_value() {
+        let line = "protocol=http1";
+        assert_eq!(sniff_protocol(line), None);
+    }
+
+    #[test]
+    fn returns_none_for_line_without_protocol_key() {
+        let line = "Registered tunnel connection connIndex=0";
+        assert_eq!(sniff_protocol(line), None);
+    }
+
+    #[test]
+    fn stops_at_space_after_protocol_value() {
+        let line = "protocol=quic connIndex=0";
+        assert_eq!(sniff_protocol(line), Some("quic".to_string()));
+    }
 }

@@ -320,3 +320,128 @@ fn push_block(
     stats.blocks_total += 1;
     unique
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // --- push_block ---
+
+    fn make_hash(byte: u8) -> blake3::Hash {
+        blake3::hash(&[byte])
+    }
+
+    #[test]
+    fn first_block_is_unique() {
+        let mut pool = Vec::new();
+        let mut index = HashMap::new();
+        let mut chunks = Vec::new();
+        let mut stats = IngestStats::default();
+        let unique = push_block(&make_hash(1), &mut pool, &mut index, &mut chunks, &mut stats);
+        assert!(unique);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(chunks, [0u32]);
+        assert_eq!(stats.blocks_total, 1);
+    }
+
+    #[test]
+    fn duplicate_block_is_not_unique() {
+        let mut pool = Vec::new();
+        let mut index = HashMap::new();
+        let mut chunks = Vec::new();
+        let mut stats = IngestStats::default();
+        let h = make_hash(42);
+        push_block(&h, &mut pool, &mut index, &mut chunks, &mut stats);
+        let unique = push_block(&h, &mut pool, &mut index, &mut chunks, &mut stats);
+        assert!(!unique);
+        assert_eq!(pool.len(), 1, "pool must not grow on duplicate");
+        assert_eq!(chunks, [0u32, 0u32], "both chunks reference same pool slot");
+        assert_eq!(stats.blocks_total, 2);
+    }
+
+    #[test]
+    fn distinct_blocks_fill_pool_sequentially() {
+        let mut pool = Vec::new();
+        let mut index = HashMap::new();
+        let mut chunks = Vec::new();
+        let mut stats = IngestStats::default();
+        for i in 0..4u8 {
+            push_block(&make_hash(i), &mut pool, &mut index, &mut chunks, &mut stats);
+        }
+        assert_eq!(pool.len(), 4);
+        assert_eq!(chunks, [0, 1, 2, 3]);
+    }
+
+    // --- to_manifest_path ---
+
+    #[test]
+    fn simple_filename_passes_through() {
+        let rel = Path::new("file.txt");
+        let abs = Path::new("/tmp/file.txt");
+        assert_eq!(to_manifest_path(rel, abs).unwrap(), "file.txt");
+    }
+
+    #[test]
+    fn nested_path_uses_forward_slashes() {
+        let rel = Path::new("a/b/c.bin");
+        let abs = Path::new("/data/a/b/c.bin");
+        let result = to_manifest_path(rel, abs).unwrap();
+        assert!(!result.contains('\\'), "must use forward slashes");
+        assert_eq!(result, "a/b/c.bin");
+    }
+
+    #[test]
+    fn dotdot_component_is_rejected_by_validate_path() {
+        // validate_path inside to_manifest_path must catch traversal
+        let rel = Path::new("../escape.txt");
+        let abs = Path::new("/tmp/../escape.txt");
+        assert!(to_manifest_path(rel, abs).is_err());
+    }
+
+    // --- ingest integration round-trip ---
+
+    #[test]
+    fn single_file_ingest_produces_correct_stats() {
+        let dir = std::env::temp_dir().join(format!("rh-ingest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, b"hello, rabbit-hole").unwrap();
+
+        let progress = crate::utils::progress::IngestProgress::hidden();
+        let (manifest, stats) = ingest(&file, crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE, &progress)
+            .expect("ingest must succeed");
+
+        assert_eq!(stats.files, 1);
+        assert_eq!(stats.bytes, 18);
+        assert_eq!(stats.blocks_total, 1);
+        assert_eq!(stats.blocks_unique, 1);
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files[0].path, "hello.txt");
+        assert_eq!(manifest.files[0].size, 18);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn duplicate_file_content_deduplicates_blocks() {
+        let dir = std::env::temp_dir().join(format!("rh-dedup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two files with identical content — should produce 1 unique block, 2 total
+        let content = vec![0xABu8; 1024];
+        std::fs::write(dir.join("a.bin"), &content).unwrap();
+        std::fs::write(dir.join("b.bin"), &content).unwrap();
+
+        let progress = crate::utils::progress::IngestProgress::hidden();
+        let (manifest, stats) = ingest(&dir, crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE, &progress)
+            .expect("ingest must succeed");
+
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.blocks_total, 2, "two files = two block references");
+        assert_eq!(stats.blocks_unique, 1, "identical content = one unique block");
+        assert_eq!(manifest.pool.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

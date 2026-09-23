@@ -259,3 +259,124 @@ pub fn memory_path_for(serve_path: &Path) -> PathBuf {
     let hash_prefix = &blake3::hash(path_str.as_bytes()).to_hex()[..16];
     state_dir().join(format!("code-{hash_prefix}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // --- validate_code ---
+
+    #[test]
+    fn valid_six_hex_chars_accepted() {
+        assert!(validate_code("a3f9c1").is_ok());
+        assert!(validate_code("000000").is_ok());
+        assert!(validate_code("FFFFFF").is_ok());
+    }
+
+    #[test]
+    fn valid_four_and_five_hex_chars_accepted() {
+        assert!(validate_code("abcd").is_ok());
+        assert!(validate_code("12345").is_ok());
+    }
+
+    #[test]
+    fn too_short_rejected() {
+        assert!(validate_code("").is_err());
+        assert!(validate_code("abc").is_err());
+    }
+
+    #[test]
+    fn too_long_rejected() {
+        assert!(validate_code("abcdef1").is_err());
+    }
+
+    #[test]
+    fn non_hex_chars_rejected() {
+        assert!(validate_code("xyz123").is_err());
+        assert!(validate_code("a3f9g1").is_err());
+        assert!(validate_code("a3f9-1").is_err());
+    }
+
+    // --- roll_code ---
+
+    #[test]
+    fn roll_code_produces_six_lowercase_hex_chars() {
+        for _ in 0..64 {
+            let code = roll_code();
+            assert_eq!(code.len(), CODE_LEN as usize, "wrong length: {code}");
+            assert!(code.chars().all(|c| c.is_ascii_hexdigit()), "non-hex: {code}");
+            assert_eq!(code, code.to_lowercase(), "not lowercase: {code}");
+        }
+    }
+
+    // --- EdgeClient::new validation ---
+
+    #[test]
+    fn edge_client_rejects_non_http_base() {
+        assert!(EdgeClient::new("ftp://example.com").is_err());
+        assert!(EdgeClient::new("example.com").is_err());
+        assert!(EdgeClient::new("").is_err());
+    }
+
+    #[test]
+    fn edge_client_strips_trailing_slash() {
+        // new() succeeds — we can't inspect `base` directly, but the call must not error
+        assert!(EdgeClient::new("https://example.com/").is_ok());
+        assert!(EdgeClient::new("http://localhost:8080/").is_ok());
+    }
+
+    // --- memory_path_for stability and uniqueness ---
+
+    #[test]
+    fn same_path_gives_same_memory_file() {
+        let p = PathBuf::from("/tmp/rh-test/dataset");
+        assert_eq!(memory_path_for(&p), memory_path_for(&p));
+    }
+
+    #[test]
+    fn different_paths_give_different_memory_files() {
+        let a = memory_path_for(&PathBuf::from("/tmp/rh-test/a"));
+        let b = memory_path_for(&PathBuf::from("/tmp/rh-test/b"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn memory_file_name_has_code_prefix_and_hex_suffix() {
+        let path = memory_path_for(&PathBuf::from("/tmp/rh-test/x"));
+        let name = path.file_name().unwrap().to_string_lossy();
+        // "code-" + 16 hex chars
+        assert!(name.starts_with("code-"), "unexpected name: {name}");
+        let suffix = &name["code-".len()..];
+        assert_eq!(suffix.len(), 16, "hash suffix wrong length: {suffix}");
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "non-hex suffix: {suffix}");
+    }
+
+    // --- state_dir XDG logic ---
+
+    #[test]
+    fn state_dir_with_absolute_xdg_state_home() {
+        // Safety: test binary is single-threaded by default; env mutation is safe in that context.
+        let dir = unsafe {
+            std::env::set_var("XDG_STATE_HOME", "/custom/state");
+            let d = state_dir();
+            std::env::remove_var("XDG_STATE_HOME");
+            d
+        };
+        assert_eq!(dir, PathBuf::from("/custom/state/rh"));
+    }
+
+    #[test]
+    fn state_dir_ignores_relative_xdg_state_home() {
+        let dir = unsafe {
+            std::env::set_var("XDG_STATE_HOME", "relative/path");
+            std::env::set_var("HOME", "/home/testuser");
+            let d = state_dir();
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::remove_var("HOME");
+            d
+        };
+        // relative XDG_STATE_HOME must be ignored; should fall back to HOME
+        assert!(dir.starts_with("/home/testuser"), "got: {dir:?}");
+    }
+}
