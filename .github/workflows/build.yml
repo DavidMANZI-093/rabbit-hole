@@ -37,12 +37,12 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             cross: false
             ext: ""
 
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             cross: true
             ext: ""
 
@@ -52,7 +52,7 @@ jobs:
             ext: ".exe"
 
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
             cross: false
             ext: ""
 
@@ -70,7 +70,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: cache cargo registry + build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -102,7 +102,7 @@ jobs:
           mv "$src" "$dst"
 
       - name: upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: rh-${{ github.ref_name }}-${{ matrix.target }}
           path: rh-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.ext }}
@@ -110,7 +110,7 @@ jobs:
           if-no-files-found: error
 
       - name: attach to GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: rh-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.ext }}
           generate_release_notes: true
