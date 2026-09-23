@@ -1,0 +1,116 @@
+# Builds release binaries for the Linux targets that `cargo check` passes:
+# x86_64 (native) and aarch64 (cross-compiled via `cross`, Docker-based).
+# Windows/macOS rows below are untested against the current dependency set.
+#
+# Target notes:
+#   linux-x86_64       — native runner, glibc, standard GNU toolchain
+#   linux-aarch64      — cross-compiled on ubuntu via `cross` (Docker-based);
+#                        needs a cross C toolchain + cmake in the image for
+#                        aws-lc-sys/ring (both vendors support linux-aarch64)
+#   windows-x86_64     — native Windows runner, MSVC toolchain
+#   macos-x86_64       — native macOS Intel runner
+#   macos-aarch64      — native macOS Apple Silicon runner
+#
+# reqwest uses rustls (aws-lc-rs provider + OS verifier), which builds fine on
+# all five targets above. musl is deliberately excluded (unverified against the
+# current rustls/aws-lc-sys C build, not a native-tls limitation).
+
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build (${{ matrix.target }} @ ${{ github.ref_name }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: false
+            ext: ""
+
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: true
+            ext: ""
+
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            cross: false
+            ext: ".exe"
+
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            cross: false
+            ext: ""
+
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            cross: false
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: cache cargo registry + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: install cross (aarch64-linux only)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: build
+        env:
+          RH_EDGE_BASE: ${{ secrets.RH_EDGE_BASE }}
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+        shell: bash
+
+      - name: rename binary for upload
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/rh${{ matrix.ext }}"
+          dst="rh-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.ext }}"
+          mv "$src" "$dst"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rh-${{ github.ref_name }}-${{ matrix.target }}
+          path: rh-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.ext }}
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: attach to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rh-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.ext }}
+          generate_release_notes: true
