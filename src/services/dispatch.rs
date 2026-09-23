@@ -5,8 +5,6 @@ use std::{
 
 use tokio::net::TcpListener;
 
-use crate::ingest::{IngestStats, ingest};
-use crate::protocol::manifest::Manifest;
 use crate::services::cli::Cmd;
 use crate::services::fetch::fetch;
 use crate::services::serve::build_shared;
@@ -18,6 +16,11 @@ use crate::utils::ui::{
     dlabel, print_fetch_summary, print_ingest_summary, print_manifest_line, print_wan_and_fetch,
     tunnel_spinner,
 };
+use crate::{
+    edge,
+    ingest::{IngestStats, ingest},
+};
+use crate::{edge::DEFUALT_TTL_SECS, protocol::manifest::Manifest};
 use crate::{info, warn};
 
 pub async fn run(cmd: Cmd) -> Result<(), String> {
@@ -26,6 +29,7 @@ pub async fn run(cmd: Cmd) -> Result<(), String> {
             path,
             block_size,
             secure,
+            edge,
             no_color,
             verbose,
         } => {
@@ -34,28 +38,31 @@ pub async fn run(cmd: Cmd) -> Result<(), String> {
                 path,
                 block_size,
                 secure,
+                edge,
                 verbose,
             })
             .await
         }
         Cmd::Fetch {
-            url,
+            code_or_url,
             dest,
             timeout,
             bearer,
             force,
             concurrency,
+            edge,
             no_color,
             verbose,
         } => {
             log::init_color(no_color);
             run_fetch(FetchOpts {
-                url,
+                code_or_url,
                 dest,
                 timeout,
                 bearer,
                 force,
                 concurrency,
+                edge,
                 verbose,
             })
             .await
@@ -107,9 +114,14 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
 
     eprintln!("  {}  {}", dlabel("LAN"), crate::utils::log::bold(&lan_url));
 
-    let (wan_url, tunnel) = start_tunnel(port).await;
+    let (wan_url, tunnel, code) = start_tunnel(port, &opts.edge, &opts.path).await;
 
-    print_wan_and_fetch(&lan_url, wan_url.as_deref(), token.as_deref());
+    print_wan_and_fetch(
+        &lan_url,
+        wan_url.as_deref(),
+        code.as_deref(),
+        token.as_deref(),
+    );
 
     let mut server_handle = server_handle;
     tokio::select! {
@@ -136,17 +148,22 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
     Ok(())
 }
 
-async fn start_tunnel(port: u16) -> (Option<String>, Option<Tunnel>) {
+// Spawns cloudflared and, if an edge base is configured, registers a short code.
+async fn start_tunnel(
+    port: u16,
+    edge_base: &str,
+    serve_path: &Path,
+) -> (Option<String>, Option<Tunnel>, Option<String>) {
     let spinner = tunnel_spinner();
     spinner.set_message("requesting...");
 
-    match tunnel::spawn(port).await {
+    let (url, tunnel) = match tunnel::spawn(port).await {
         Ok(t) => {
             t.watch_exit();
             let url_clone = t.url.clone();
             let live = t
                 .wait_until_live(|msg| {
-                    spinner.set_message(format!("{url_clone}  {msg}",));
+                    spinner.set_message(format!("{url_clone}  {msg}"));
                 })
                 .await;
             spinner.finish_and_clear();
@@ -160,7 +177,23 @@ async fn start_tunnel(port: u16) -> (Option<String>, Option<Tunnel>) {
             warn!("cloudflared not found ({e}) — LAN only (run: rh check)");
             (None, None)
         }
-    }
+    };
+
+    let code = match (url.as_deref(), edge_base.is_empty()) {
+        (Some(url), false) => {
+            let memory = edge::memory_path_for(serve_path);
+            match edge::try_claim_remembered(edge_base, url, DEFUALT_TTL_SECS, &memory).await {
+                Some(c) => {
+                    info!("edge code  {c}  (ttl {DEFUALT_TTL_SECS}s)");
+                    Some(c)
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+
+    (url, tunnel, code)
 }
 
 // ---------- fetch ----------
@@ -168,11 +201,12 @@ async fn start_tunnel(port: u16) -> (Option<String>, Option<Tunnel>) {
 async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
     log::set_verbose(opts.verbose);
 
-    info!("fetching from: {}", opts.url);
+    let url = resolve(&opts.code_or_url, &opts.edge).await?;
+    info!("fetching from: {url}");
 
     let progress = FetchProgress::new(opts.concurrency);
     let result = fetch(
-        &opts.url,
+        &url,
         &opts.dest,
         opts.timeout,
         opts.bearer,
@@ -196,10 +230,28 @@ async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
     Ok(())
 }
 
+// Resolves `code_or_url` to a full HTTPS URL.
+async fn resolve(code_or_url: &str, edge_base: &str) -> Result<String, String> {
+    if code_or_url.starts_with("http://") || code_or_url.starts_with("https://") {
+        return Ok(code_or_url.to_string());
+    }
+    if edge_base.is_empty() {
+        return Err(format!(
+            "{code_or_url:?} looks like a short code but no edge base is configured \
+             (set RH_EDGE_BASE at build time or pass --edge <url>)"
+        ));
+    }
+    edge::EdgeClient::new(edge_base)
+        .map_err(|e| e.to_string())?
+        .lookup(code_or_url)
+        .await
+        .map_err(|e| format!("edge lookup of {code_or_url:?}: {e}"))
+}
+
 // ---------- check ----------
 
 async fn run_check() -> Result<(), String> {
-    // longest label is n chars; pad to n + 1
+    // Longest label is "cloudflared" (11 chars) → pad to 12 for alignment
     let lbl = |s: &str| crate::utils::log::dim(&format!("{s:<12}"));
 
     // cloudflared
@@ -246,16 +298,18 @@ struct ServeOpts {
     path: PathBuf,
     block_size: u32,
     secure: bool,
+    edge: String,
     verbose: bool,
 }
 
 struct FetchOpts {
-    url: String,
+    code_or_url: String,
     dest: PathBuf,
     timeout: u32,
     bearer: Option<String>,
     force: bool,
     concurrency: u8,
+    edge: String,
     verbose: bool,
 }
 

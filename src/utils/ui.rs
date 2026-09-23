@@ -63,14 +63,26 @@ pub fn print_manifest_line(len: u64) {
     eprintln!();
 }
 
-pub fn print_wan_and_fetch(lan: &str, wan: Option<&str>, token: Option<&str>) {
+pub fn print_wan_and_fetch(lan: &str, wan: Option<&str>, code: Option<&str>, token: Option<&str>) {
     if let Some(wan_url) = wan {
         eprintln!("  {}  {}", dlabel("WAN"), bold(wan_url));
     }
     let target = wan.unwrap_or(lan);
     let fetch_cmd = match token {
-        Some(_) => format!("fetch with `rh fetch {target} <dest> --bearer <token>`"),
-        None => format!("fetch with, `rh fetch {target} <dest>`"),
+        Some(_) => {
+            if let Some(c) = code {
+                format!("fetch with `rh fetch {c} <dest> --bearer <token>`")
+            } else {
+                format!("fetch with `rh fetch {target} <dest> --bearer <token>`")
+            }
+        }
+        None => {
+            if let Some(c) = code {
+                format!("fetch with, `rh fetch {c} <dest>`")
+            } else {
+                format!("fetch with, `rh fetch {target} <dest>`")
+            }
+        }
     };
     if let Some(t) = token {
         eprintln!();
