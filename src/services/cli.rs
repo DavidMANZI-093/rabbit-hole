@@ -11,7 +11,8 @@ use crate::{
 #[command(
     name = "rh",
     version,
-    about = "rabbit-hole is a file-sharing tool for sending files and folders as-is (no archiving or repackaging) directly; with no middleman holding or staging; and per-block end-to-end hash verification."
+    max_term_width = 80,
+    about = "rabbit-hole is a file transfer utility for sharing files and folders as-is (no archiving or repackaging) directly; with no middleman holding or staging; and per-block end-to-end hash verification."
 )]
 pub struct Cli {
     #[command(subcommand)]
