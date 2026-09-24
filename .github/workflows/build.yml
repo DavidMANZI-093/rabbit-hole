@@ -88,29 +88,33 @@ jobs:
           RH_EDGE_BASE: ${{ secrets.RH_EDGE_BASE }}
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --locked --target ${{ matrix.target }}
+            cross build --profile dist --locked --target ${{ matrix.target }}
           else
-            cargo build --release --locked --target ${{ matrix.target }}
+            cargo build --profile dist --locked --target ${{ matrix.target }}
           fi
         shell: bash
 
       - name: rename binary for upload
         shell: bash
         run: |
-          src="target/${{ matrix.target }}/release/rh${{ matrix.ext }}"
-          dst="rh-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.ext }}"
+          src="target/${{ matrix.target }}/dist/rh${{ matrix.ext }}"
+          dst="rh${{ matrix.ext }}"
           mv "$src" "$dst"
+
+      - name: package zip
+        shell: pwsh
+        run: Compress-Archive -Path "rh${{ matrix.ext }}" -DestinationPath "rh-${{ github.ref_name }}-${{ matrix.target }}.zip"
 
       - name: upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: rh-${{ github.ref_name }}-${{ matrix.target }}
-          path: rh-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.ext }}
+          path: rh${{ matrix.ext }}
           retention-days: 90
           if-no-files-found: error
 
       - name: attach to GitHub release
         uses: softprops/action-gh-release@v3
         with:
-          files: rh-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.ext }}
+          files: rh-${{ github.ref_name }}-${{ matrix.target }}.zip
           generate_release_notes: true
