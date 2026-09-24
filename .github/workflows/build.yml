@@ -101,10 +101,6 @@ jobs:
           dst="rh${{ matrix.ext }}"
           mv "$src" "$dst"
 
-      - name: package zip
-        shell: pwsh
-        run: Compress-Archive -Path "rh${{ matrix.ext }}" -DestinationPath "rh-${{ github.ref_name }}-${{ matrix.target }}.zip"
-
       - name: upload artifact
         uses: actions/upload-artifact@v6
         with:
@@ -113,8 +109,32 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
+  release:
+    name: release (${{ github.ref_name }})
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          path: dist-artifacts
+
+      - name: package zips
+        shell: pwsh
+        run: |
+          $dest = Join-Path (Get-Location) "dist-zips"
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+          Get-ChildItem -Path dist-artifacts -Directory | ForEach-Object {
+            Push-Location $_.FullName
+            try {
+              $bin = Get-ChildItem -File | Select-Object -First 1
+              Compress-Archive -Path $bin.Name -DestinationPath (Join-Path $dest "$($_.Name).zip")
+            } finally { Pop-Location }
+          }
+
       - name: attach to GitHub release
         uses: softprops/action-gh-release@v3
         with:
-          files: rh-${{ github.ref_name }}-${{ matrix.target }}.zip
+          files: dist-zips/*.zip
           generate_release_notes: true
