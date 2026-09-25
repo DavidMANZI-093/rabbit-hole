@@ -1,0 +1,15 @@
+name               = "rabbit-hole-edge"
+main               = "src/index.js"
+compatibility_date = "2026-09-09"
+
+[[kv_namespaces]]
+binding = "RH_CODES"
+id      = "0d9766101ed8479081d129a9e3a11771"
+
+[observability.logs]
+enabled          = true
+invocation_logs  = true
+head_sampling_rate = 1
+
+[observability.traces]
+enabled = true
