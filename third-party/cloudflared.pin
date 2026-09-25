@@ -1,0 +1,24 @@
+# Pinned cloudflared dependency binary for rabbit-hole.
+#
+# Single source of truth, consumed by:
+#   - install.sh / install.ps1  (CLOUDFLARED_VERSION + per-asset sha256)
+#   - src/cloudflared.rs tests  (MIN line must equal `MIN` const)
+#
+# MIN:    oldest supported release. `--no-prechecks` flag feature is TUN-10387,
+#         first shipped in 2026.5.0.
+# PINNED: release installers fetch. Must be >= MIN. Rationale for the current
+#         value: 2026.9.1 is what dev/CI smoke-tested against tunnel spawn flags.
+#
+# Pin-bump procedure: update PINNED + hashes below (copy from the upstream
+# release notes' SHA256 section), keep MIN unless we adopt a younger feature/flag,
+# then run `cargo test pin_` to verify consistency.
+MIN=2026.5.0
+PINNED=2026.9.1
+
+# sha256 of each pinned asset, verbatim from
+# https://github.com/cloudflare/cloudflared/releases/tag/2026.9.1
+cloudflared-linux-amd64 03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc
+cloudflared-linux-arm64 3d97437c71848bd8df68041e12436b484a661d95073ea1937f01a845ce88faa3
+cloudflared-darwin-amd64.tgz 1ea07ae775b03236bd6be18ca1848d6bdc4af2f4f3bce398823b5a36e5761b75
+cloudflared-darwin-arm64.tgz 9a0b19f67dc7a3011bc6b972c7ce06a5fcea8784ac6bd599ffa382ea4aeb5a6e
+cloudflared-windows-amd64.exe 2837888cc0f5d58f15b6dc478376de90b4d3ba5241c7947455d1e0a0df429712

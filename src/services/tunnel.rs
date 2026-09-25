@@ -33,7 +33,7 @@ pub async fn spawn(port: u16) -> Result<Tunnel, String> {
         compat = true;
     }
 
-    let mut cmd = tokio::process::Command::new("cloudflared");
+    let mut cmd = tokio::process::Command::new(crate::cloudflared::binary());
     cmd.arg("tunnel").arg("--no-autoupdate");
     if !compat {
         cmd.arg("--no-prechecks"); // skip post-connection diagnostic table (~6s wasted otherwise)

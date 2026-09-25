@@ -254,8 +254,8 @@ async fn run_check() -> Result<(), String> {
     // Longest label is "cloudflared" (11 chars) → pad to 12 for alignment
     let lbl = |s: &str| crate::utils::log::dim(&format!("{s:<12}"));
 
-    // cloudflared
-    match std::process::Command::new("cloudflared")
+    // cloudflared (resolved binary: private prefix, exe dir, or PATH)
+    match std::process::Command::new(crate::cloudflared::binary())
         .arg("--version")
         .output()
     {
@@ -270,12 +270,18 @@ async fn run_check() -> Result<(), String> {
                     }
                     crate::cloudflared::Verdict::Unknown => "version unknown".to_string(),
                 };
+            let src = if crate::cloudflared::is_bundled() {
+                "bundled"
+            } else {
+                "PATH"
+            };
             eprintln!(
-                "  {}  {}   {}   {}",
+                "  {}  {}   {}   {} ({})",
                 lbl("cloudflared"),
                 ver,
                 check_ok(),
-                verdict
+                verdict,
+                src
             );
         }
         _ => {
