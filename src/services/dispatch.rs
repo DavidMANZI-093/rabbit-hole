@@ -262,7 +262,21 @@ async fn run_check() -> Result<(), String> {
         Ok(out) if out.status.success() => {
             let raw = String::from_utf8_lossy(&out.stdout);
             let ver = raw.lines().next().unwrap_or("?").trim().to_string();
-            eprintln!("  {}  {}   {}", lbl("cloudflared"), ver, check_ok());
+            let verdict =
+                match crate::cloudflared::classify(crate::cloudflared::parse_version(&raw)) {
+                    crate::cloudflared::Verdict::Supported(_) => "supported".to_string(),
+                    crate::cloudflared::Verdict::TooOld(_) => {
+                        format!("too old (need >= {})", crate::cloudflared::MIN)
+                    }
+                    crate::cloudflared::Verdict::Unknown => "version unknown".to_string(),
+                };
+            eprintln!(
+                "  {}  {}   {}   {}",
+                lbl("cloudflared"),
+                ver,
+                check_ok(),
+                verdict
+            );
         }
         _ => {
             eprintln!(

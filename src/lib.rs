@@ -1,3 +1,4 @@
+pub mod cloudflared;
 pub mod edge;
 pub mod fs;
 pub mod ingest;

@@ -20,11 +20,25 @@ const PROTOCOL_PEEK: Duration = Duration::from_millis(600);
 
 pub async fn spawn(port: u16) -> Result<Tunnel, String> {
     let origin = format!("http://127.0.0.1:{port}");
+
+    // `--no-prechecks` needs cloudflared >= MIN (TUN-10387, 2026.5.0).
+    // Older binaries get the compat arg set (prechecks cost ~6s but WAN works).
+    // Unknown versions get full args; can't punish what we can't classify.
+    let mut compat = false;
+    if let crate::cloudflared::Verdict::TooOld(v) = crate::cloudflared::probe() {
+        crate::warn!(
+            "cloudflared {v} predates minimum {} (tunnel needs --no-prechecks); upgrade cloudflared — running with compat flags",
+            crate::cloudflared::MIN
+        );
+        compat = true;
+    }
+
     let mut cmd = tokio::process::Command::new("cloudflared");
+    cmd.arg("tunnel").arg("--no-autoupdate");
+    if !compat {
+        cmd.arg("--no-prechecks"); // skip post-connection diagnostic table (~6s wasted otherwise)
+    }
     cmd.args([
-        "tunnel",
-        "--no-autoupdate",
-        "--no-prechecks", // skip post-connection diagnostic table (~6s wasted otherwise)
         "--metrics",
         "localhost:0", // random port — avoids conflicts with existing instances
         "--url",
