@@ -184,7 +184,7 @@ impl EdgeClient {
 }
 
 fn validate_code(code: &str) -> Result<(), EdgeError> {
-    if (4..=6).contains(&code.len()) && code.chars().all(|c| c.is_ascii_hexdigit()) {
+    if code.len() == CODE_LEN as usize && code.chars().all(|c| c.is_ascii_hexdigit()) {
         Ok(())
     } else {
         Err(EdgeError::Other(format!(
@@ -275,9 +275,9 @@ mod tests {
     }
 
     #[test]
-    fn valid_four_and_five_hex_chars_accepted() {
-        assert!(validate_code("abcd").is_ok());
-        assert!(validate_code("12345").is_ok());
+    fn four_and_five_hex_chars_rejected() {
+        assert!(validate_code("abcd").is_err());
+        assert!(validate_code("12345").is_err());
     }
 
     #[test]

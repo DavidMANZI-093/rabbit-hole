@@ -11,7 +11,7 @@
 
 // ------ constants ------
 
-const CODE_RE = /^[0-9a-f]{4,6}$/i;
+const CODE_RE = /^[0-9a-f]{6}$/i;
 const DEFAULT_TTL = 14_400; // 4 hours, matching DEFUALT_TTL_SECS in edge.rs
 const MAX_TTL = 86_400; // seconds, 24 hours
 const ROLL_ATTEMPTS = 64; // afford more rolls than client (8)
@@ -72,7 +72,7 @@ async function handleClaim(req, env, log) {
   if (want !== null) {
     if (typeof want !== "string" || !CODE_RE.test(want)) {
       log.warn("claim: bad want", want);
-      return json({ error: "want must be 4-6 hex chars" }, 400);
+      return json({ error: "want must be 6 hex chars" }, 400);
     }
     const code = want.toLowerCase();
     const cur = await env.RH_CODES.get(code);
