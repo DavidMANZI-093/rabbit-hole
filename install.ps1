@@ -21,7 +21,7 @@ function Invoke-Step([string]$Label, [scriptblock]$Action) {
 if (-not [Environment]::Is64BitOperatingSystem) {
     throw "only 64-bit Windows is supported (no x86 rh builds published)"
 }
-$Target = "x86_64-pc-windows-msvc"
+$Target = "x86_64-pc-windows-gnu"
 $CfAsset = "cloudflared-windows-amd64.exe"
 
 # ------ Version resolution ------
