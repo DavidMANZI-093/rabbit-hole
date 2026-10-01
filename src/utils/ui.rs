@@ -13,13 +13,18 @@ pub fn dlabel(s: &str) -> String {
 
 pub fn tunnel_spinner() -> ProgressBar {
     let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""])
-            .template(&format!("  {}  {{spinner}} {{msg}}", dlabel("tunnel")))
-            .expect("valid spinner template"),
-    );
-    pb.enable_steady_tick(Duration::from_millis(80));
+    if crate::utils::log::is_unicode() {
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""])
+                .template(&format!("  {}  {{spinner}} {{msg}}", dlabel("tunnel")))
+                .expect("valid spinner template"),
+        );
+        pb.enable_steady_tick(Duration::from_millis(80));
+    } else {
+        // Legacy/piped terminals: no braille, no ticker thread, no output.
+        pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+    }
     pb
 }
 

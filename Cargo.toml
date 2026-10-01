@@ -21,6 +21,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 walkdir = "2.5.0"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [profile.release]
 opt-level = "z"
 lto = "thin"

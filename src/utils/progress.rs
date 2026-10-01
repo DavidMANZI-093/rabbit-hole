@@ -59,18 +59,30 @@ pub struct IngestProgress {
 
 impl IngestProgress {
     pub fn new() -> Self {
+        let animated = crate::utils::log::is_unicode();
+        let ticks: &[&str] = if animated {
+            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        } else {
+            &["|", "/", "-", "\\"]
+        };
+
         let mp = MultiProgress::new();
         let style = ProgressStyle::with_template("{spinner} {msg}")
             .expect("progress template")
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+            .tick_strings(ticks);
 
         let activity = mp.add(ProgressBar::new_spinner());
         activity.set_style(style.clone());
-        activity.enable_steady_tick(Duration::from_millis(80));
 
         let stats = mp.add(ProgressBar::new_spinner());
         stats.set_style(style);
-        stats.enable_steady_tick(Duration::from_millis(80));
+        if animated {
+            activity.enable_steady_tick(Duration::from_millis(80));
+            stats.enable_steady_tick(Duration::from_millis(80));
+        } else {
+            activity.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+            stats.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+        }
 
         let now = Instant::now();
         let this = Self {
@@ -352,17 +364,17 @@ impl FetchProgress {
             speed_bytes: 0,
         });
         drop(guard);
-        self.refresh_summary_force();
-    }
 
-    pub fn hide(&self) {
-        if let Some(st) = self.inner.state.lock().expect("fetch state lock").as_ref() {
+        if !crate::utils::log::is_unicode()
+            && let Some(st) = self.inner.state.lock().expect("fetch state lock").as_ref()
+        {
             for s in &st.slots {
                 s.set_draw_target(indicatif::ProgressDrawTarget::hidden());
             }
             st.summary
                 .set_draw_target(indicatif::ProgressDrawTarget::hidden());
         }
+        self.refresh_summary_force();
     }
 
     pub fn acquire_slot(&self) -> usize {
