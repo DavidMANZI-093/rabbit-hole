@@ -172,9 +172,14 @@ async fn start_tunnel(
             }
             (Some(t.url.clone()), Some(t))
         }
-        Err(e) => {
+        Err(tunnel::SpawnError::NotInstalled(e)) => {
             spinner.finish_and_clear();
             warn!("cloudflared not found ({e}) — LAN only (run: rh check)");
+            (None, None)
+        }
+        Err(tunnel::SpawnError::NoTunnelUrl(e)) => {
+            spinner.finish_and_clear();
+            warn!("no tunnel URL ({e}) — LAN only (check your internet connection)");
             (None, None)
         }
     };

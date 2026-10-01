@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     process::Stdio,
     sync::{
         Arc,
@@ -18,7 +19,29 @@ const LIVE_TIMEOUT: Duration = Duration::from_secs(45);
 // of the URL line — 600ms is generous but cheap to wait
 const PROTOCOL_PEEK: Duration = Duration::from_millis(600);
 
-pub async fn spawn(port: u16) -> Result<Tunnel, String> {
+// Why a tunnel never materialized. Typed so callers blame accurately
+// instead of printing one misleading message for every failure.
+#[derive(Debug)]
+pub enum SpawnError {
+    NotInstalled(String),
+    NoTunnelUrl(String),
+}
+
+impl fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotInstalled(e) | Self::NoTunnelUrl(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+pub async fn spawn(port: u16) -> Result<Tunnel, SpawnError> {
+    if !crate::utils::net::has_internet().await {
+        return Err(SpawnError::NoTunnelUrl(
+            "no internet route to Cloudflare (1.1.1.1:443 unreachable)".to_string(),
+        ));
+    }
+
     let origin = format!("http://127.0.0.1:{port}");
 
     // `--no-prechecks` needs cloudflared >= MIN (TUN-10387, 2026.5.0).
@@ -51,12 +74,12 @@ pub async fn spawn(port: u16) -> Result<Tunnel, String> {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("spawning cloudflared: {e}"))?;
+        .map_err(|e| SpawnError::NotInstalled(format!("spawning cloudflared: {e}")))?;
 
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "cloudflared stderr not piped".to_string())?;
+        .ok_or_else(|| SpawnError::NotInstalled("cloudflared stderr not piped".to_string()))?;
     let mut lines = BufReader::new(stderr).lines();
 
     // Phase 1: wait for subdomain assignment (~5s API round-trip to trycloudflare.com)
@@ -64,16 +87,20 @@ pub async fn spawn(port: u16) -> Result<Tunnel, String> {
         while let Some(line) = lines
             .next_line()
             .await
-            .map_err(|e| format!("reading cloudflared stderr: {e}"))?
+            .map_err(|e| SpawnError::NoTunnelUrl(format!("reading cloudflared stderr: {e}")))?
         {
             if let Some(u) = sniff_url(&line) {
-                return Ok::<String, String>(u);
+                return Ok::<String, SpawnError>(u);
             }
         }
-        Err("cloudflared exited before printing a tunnel URL".to_string())
+        Err(SpawnError::NoTunnelUrl(
+            "cloudflared exited before printing a tunnel URL".to_string(),
+        ))
     })
     .await
-    .map_err(|_| "timed out waiting for cloudflared URL (60s)".to_string())??;
+    .map_err(|_| {
+        SpawnError::NoTunnelUrl("timed out waiting for cloudflared URL (60s)".to_string())
+    })??;
 
     // Phase 2: peek briefly for the protocol log line which follows immediately
     // e.g. "Registered tunnel connection connIndex=0 ... protocol=quic"
