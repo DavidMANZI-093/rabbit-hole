@@ -5,10 +5,12 @@ use crate::protocol::manifest::common::{
 
 pub mod common;
 pub mod v1;
+pub mod v2;
 
-// Encode uses CURRENT; decode accepts CURRENT and predecessors
-// per the support policy (current + previous).
-pub const CURRENT: u16 = 1;
+// Decode accepts CURRENT and predecessors per the support policy
+// (current + previous). Encode uses the lowest version expressing the
+// content (see 'encode').
+pub const CURRENT: u16 = 2;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileEntry {
@@ -24,6 +26,7 @@ pub struct Manifest {
     pub block_size: u32,
     pub pool: Vec<[u8; 32]>,
     pub files: Vec<FileEntry>,
+    pub root: Option<String>,
 }
 
 impl Manifest {
@@ -42,6 +45,24 @@ impl Manifest {
                 self.pool.len() as u64,
                 MAX_BLOCKS as u64,
             ));
+        }
+        if let Some(r) = &self.root {
+            validate_path(r)?;
+            if r.contains('/') {
+                return Err(ManifestError::BadPath(
+                    r.clone(),
+                    "root must be a single path component",
+                ));
+            }
+            let prefix = format!("{r}/");
+            for f in &self.files {
+                if !f.path.starts_with(prefix.as_str()) {
+                    return Err(ManifestError::BadPath(
+                        f.path.clone(),
+                        "outside manifest root",
+                    ));
+                }
+            }
         }
         let mut seen = std::collections::HashSet::with_capacity(self.files.len());
         for f in &self.files {
@@ -82,9 +103,11 @@ impl Manifest {
 // ---------- version dispatch ----------
 
 pub fn encode(m: &Manifest) -> Vec<u8> {
-    match CURRENT {
-        1 => v1::encode(m),
-        _ => unreachable!("CURRENT has no encode"),
+    match &m.root {
+        Some(_) => v2::encode(m),
+        None => v1::encode(m),
+        // NOTE: broken/unknown arm is handled by 'peek_version()' at decode stage.
+        // This allows for manifest shape-based extension.
     }
 }
 
@@ -94,6 +117,7 @@ pub fn decode(input: &[u8]) -> Result<Manifest, ManifestError> {
     }
     match peek_version(input)? {
         1 => v1::decode(input),
+        2 => v2::decode(input),
         v => Err(ManifestError::UnsupportedVersion(v)),
     }
 }
@@ -124,6 +148,7 @@ mod tests {
     fn empty_manifest_roundtrips() {
         let m = Manifest {
             block_size: DEFAULT_BLOCK_SIZE,
+            root: None,
             pool: vec![],
             files: vec![],
         };
@@ -137,6 +162,7 @@ mod tests {
         let hash = make_hash(1);
         let m = Manifest {
             block_size: DEFAULT_BLOCK_SIZE,
+            root: None,
             pool: vec![hash],
             files: vec![FileEntry {
                 path: "hello.txt".to_string(),
@@ -156,6 +182,7 @@ mod tests {
         let hash = make_hash(2);
         let m = Manifest {
             block_size: DEFAULT_BLOCK_SIZE,
+            root: None,
             pool: vec![hash],
             files: vec![FileEntry {
                 path: "script.sh".to_string(),
@@ -175,6 +202,7 @@ mod tests {
         let hash = make_hash(3);
         let m = Manifest {
             block_size: DEFAULT_BLOCK_SIZE,
+            root: None,
             pool: vec![hash],
             files: vec![
                 FileEntry {
@@ -203,6 +231,7 @@ mod tests {
         let hash = make_hash(4);
         let m = Manifest {
             block_size: DEFAULT_BLOCK_SIZE,
+            root: None,
             pool: vec![hash],
             files: vec![FileEntry {
                 path: "old.txt".to_string(),
@@ -228,10 +257,110 @@ mod tests {
     fn truncated_input_is_rejected() {
         let m = Manifest {
             block_size: DEFAULT_BLOCK_SIZE,
+            root: None,
             pool: vec![],
             files: vec![],
         };
         let full = encode(&m);
         assert!(decode(&full[..full.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn encode_picks_v1_for_rootless() {
+        let m = Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            root: None,
+            pool: vec![],
+            files: vec![],
+        };
+        assert_eq!(peek_version(&encode(&m)).unwrap(), 1);
+    }
+
+    #[test]
+    fn encode_picks_v2_for_rooted() {
+        let m = Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            root: Some("photos".to_string()),
+            pool: vec![],
+            files: vec![],
+        };
+        let bytes = encode(&m);
+        assert_eq!(peek_version(&bytes).unwrap(), 2);
+        assert_eq!(decode(&bytes).expect("decode failed"), m);
+    }
+
+    #[test]
+    fn frozen_v1_bytes_decode_flat() {
+        let bytes = vec![
+            b'R', b'H', b'B', b'1', // magic
+            1, 0, // version
+            0, 0, // flags
+            0, 0, 16, 0, // block size 1 MiB LE
+            0, // file count
+            0, // pool count
+        ];
+        let m = decode(&bytes).expect("decode failed");
+        assert_eq!(m.root, None);
+        assert!(m.files.is_empty());
+    }
+
+    #[test]
+    fn future_version_rejected_with_upgrade_error() {
+        let m = Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            root: None,
+            pool: vec![],
+            files: vec![],
+        };
+        let mut bytes = encode(&m);
+        bytes[4] = 9;
+        bytes[5] = 0;
+        let err = decode(&bytes).unwrap_err();
+        assert!(matches!(err, ManifestError::UnsupportedVersion(9)));
+    }
+
+    #[test]
+    fn rooted_manifest_validates() {
+        let m = Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            root: Some("photos".to_string()),
+            pool: vec![],
+            files: vec![FileEntry {
+                path: "photos/a.txt".to_string(),
+                size: 0,
+                mode: None,
+                mtime_ns: None,
+                chunks: vec![],
+            }],
+        };
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn root_with_slash_rejected() {
+        let m = Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            root: Some("a/b".to_string()),
+            pool: vec![],
+            files: vec![],
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn file_outside_root_rejected() {
+        let m = Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            root: Some("photos".to_string()),
+            pool: vec![],
+            files: vec![FileEntry {
+                path: "other/a.txt".to_string(),
+                size: 0,
+                mode: None,
+                mtime_ns: None,
+                chunks: vec![],
+            }],
+        };
+        assert!(m.validate().is_err());
     }
 }

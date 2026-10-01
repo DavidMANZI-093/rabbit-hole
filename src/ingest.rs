@@ -64,6 +64,7 @@ pub fn ingest(
     let mut index: HashMap<[u8; 32], u32> = HashMap::new();
     let mut files: Vec<FileEntry> = Vec::new();
     let mut stats = IngestStats::default();
+    let mut root: Option<String> = None;
 
     let meta = fs::metadata(src).map_err(IngestError::Fs)?;
 
@@ -83,6 +84,7 @@ pub fn ingest(
             files.push(entry);
         }
         Kind::Dir => {
+            let root_name = dir_root_name(src)?;
             let mut paths: Vec<(PathBuf, u64, String)> = Vec::new();
             let walker = walkdir::WalkDir::new(src)
                 .follow_links(false)
@@ -146,7 +148,7 @@ pub fn ingest(
                     }
                 };
 
-                paths.push((abs, size, rel));
+                paths.push((abs, size, format!("{root_name}/{rel}")));
             }
             paths.sort_by(|a, b| a.2.cmp(&b.2));
 
@@ -167,6 +169,7 @@ pub fn ingest(
                 )?;
                 files.push(entry);
             }
+            root = Some(root_name);
         }
         Kind::Other => {
             return Err(IngestError::Walk(format!(
@@ -181,11 +184,26 @@ pub fn ingest(
         block_size,
         pool,
         files,
+        root,
     };
     manifest
         .validate()
         .map_err(|e| IngestError::Walk(format!("post-ingest error {e}")))?;
     Ok((manifest, stats))
+}
+
+fn dir_root_name(src: &Path) -> Result<String, IngestError> {
+    let raw = src.file_name().map(|s| s.to_os_string()).or_else(|| {
+        src.canonicalize()
+            .ok()
+            .and_then(|c| c.file_name().map(|s| s.to_os_string()))
+    });
+    let name = raw.and_then(|s| s.into_string().ok()).ok_or_else(|| {
+        IngestError::BadName(format!("cannot derive share name from {}", src.display()))
+    })?;
+    validate_path(&name)
+        .map_err(|e| IngestError::BadName(format!("invalid share name {name:?} ({e})")))?;
+    Ok(name)
 }
 
 fn single_file_manifest_path(src: &Path) -> Result<String, IngestError> {
@@ -338,7 +356,13 @@ mod tests {
         let mut index = HashMap::new();
         let mut chunks = Vec::new();
         let mut stats = IngestStats::default();
-        let unique = push_block(&make_hash(1), &mut pool, &mut index, &mut chunks, &mut stats);
+        let unique = push_block(
+            &make_hash(1),
+            &mut pool,
+            &mut index,
+            &mut chunks,
+            &mut stats,
+        );
         assert!(unique);
         assert_eq!(pool.len(), 1);
         assert_eq!(chunks, [0u32]);
@@ -367,7 +391,13 @@ mod tests {
         let mut chunks = Vec::new();
         let mut stats = IngestStats::default();
         for i in 0..4u8 {
-            push_block(&make_hash(i), &mut pool, &mut index, &mut chunks, &mut stats);
+            push_block(
+                &make_hash(i),
+                &mut pool,
+                &mut index,
+                &mut chunks,
+                &mut stats,
+            );
         }
         assert_eq!(pool.len(), 4);
         assert_eq!(chunks, [0, 1, 2, 3]);
@@ -409,8 +439,12 @@ mod tests {
         std::fs::write(&file, b"hello, rabbit-hole").unwrap();
 
         let progress = crate::utils::progress::IngestProgress::hidden();
-        let (manifest, stats) = ingest(&file, crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE, &progress)
-            .expect("ingest must succeed");
+        let (manifest, stats) = ingest(
+            &file,
+            crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE,
+            &progress,
+        )
+        .expect("ingest must succeed");
 
         assert_eq!(stats.files, 1);
         assert_eq!(stats.bytes, 18);
@@ -424,6 +458,77 @@ mod tests {
     }
 
     #[test]
+    fn dir_ingest_records_wrapper_root() {
+        use crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE;
+        let dir = std::env::temp_dir().join(format!("rh-wrap-{}", std::process::id()));
+        let photos = dir.join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+        std::fs::write(photos.join("a.txt"), b"aaa").unwrap();
+        std::fs::write(photos.join("b.txt"), b"bbb").unwrap();
+
+        let progress = crate::utils::progress::IngestProgress::hidden();
+        let (manifest, _) =
+            ingest(&photos, DEFAULT_BLOCK_SIZE, &progress).expect("ingest must succeed");
+
+        assert_eq!(manifest.root, Some("photos".to_string()));
+        assert_eq!(manifest.files.len(), 2);
+        assert!(
+            manifest.files.iter().all(|f| f.path.starts_with("photos/")),
+            "all paths travel under the wrapper: {:?}",
+            manifest.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(manifest.validate().is_ok());
+        let bytes = crate::protocol::manifest::encode(&manifest);
+        assert_eq!(
+            crate::protocol::manifest::peek_version(&bytes).unwrap(),
+            2,
+            "rooted manifests encode as v2"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn single_file_ingest_has_no_root() {
+        use crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE;
+        let dir = std::env::temp_dir().join(format!("rh-noroot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("solo.txt");
+        std::fs::write(&file, b"solo").unwrap();
+
+        let progress = crate::utils::progress::IngestProgress::hidden();
+        let (manifest, _) =
+            ingest(&file, DEFAULT_BLOCK_SIZE, &progress).expect("ingest must succeed");
+
+        assert_eq!(manifest.root, None);
+        let bytes = crate::protocol::manifest::encode(&manifest);
+        assert_eq!(
+            crate::protocol::manifest::peek_version(&bytes).unwrap(),
+            1,
+            "rootless manifests stay v1"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dir_root_name_resolves_dot_via_canonicalization() {
+        // "." has no file_name; the name must come from the resolved dir.
+        let cwd = std::env::current_dir().expect("cwd");
+        let base = cwd
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("cwd must have a UTF-8 name")
+            .to_string();
+        assert_eq!(dir_root_name(std::path::Path::new(".")).unwrap(), base);
+    }
+
+    #[test]
+    fn dir_root_name_rejects_root_dir() {
+        assert!(dir_root_name(std::path::Path::new("/")).is_err());
+    }
+
+    #[test]
     fn duplicate_file_content_deduplicates_blocks() {
         let dir = std::env::temp_dir().join(format!("rh-dedup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -434,12 +539,19 @@ mod tests {
         std::fs::write(dir.join("b.bin"), &content).unwrap();
 
         let progress = crate::utils::progress::IngestProgress::hidden();
-        let (manifest, stats) = ingest(&dir, crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE, &progress)
-            .expect("ingest must succeed");
+        let (manifest, stats) = ingest(
+            &dir,
+            crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE,
+            &progress,
+        )
+        .expect("ingest must succeed");
 
         assert_eq!(stats.files, 2);
         assert_eq!(stats.blocks_total, 2, "two files = two block references");
-        assert_eq!(stats.blocks_unique, 1, "identical content = one unique block");
+        assert_eq!(
+            stats.blocks_unique, 1,
+            "identical content = one unique block"
+        );
         assert_eq!(manifest.pool.len(), 1);
 
         std::fs::remove_dir_all(&dir).ok();

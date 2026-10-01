@@ -53,17 +53,34 @@ pub fn build_shared(
     src: &Path,
     token: Option<String>,
 ) -> Result<Arc<Shared>, String> {
+    // Validate before encoding: encode() debug-asserts validity, which
+    // panics in debug builds instead of returning Err on corrupt input.
+    manifest
+        .validate()
+        .map_err(|e| format!("invalid manifest: {e}"))?;
+
     let manifest_bytes = protocol::manifest::encode(manifest);
     let etag = blake3::hash(&manifest_bytes).to_hex().to_string();
     let bs = manifest.block_size as u64;
     let single = src.is_file();
 
     let mut blocks_build: HashMap<[u8; 32], Vec<Locator>> = HashMap::new();
+    let root_prefix: Option<String> = manifest.root.clone().map(|r| format!("{r}/"));
     for f in &manifest.files {
+        let rel = match &root_prefix {
+            Some(prefix) => f.path.strip_prefix(prefix.as_str()).ok_or_else(|| {
+                format!(
+                    "manifest path {} outside root {}",
+                    f.path,
+                    manifest.root.as_deref().unwrap_or("?")
+                )
+            })?,
+            None => f.path.as_str(),
+        };
         let abs = if single {
             src.to_path_buf()
         } else {
-            src.join(&f.path)
+            src.join(rel)
         };
 
         for (j, idx) in f.chunks.iter().enumerate() {
@@ -273,6 +290,44 @@ fn bearer_ok(headers: &HeaderMap, q: &HashMap<String, String>, expected: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rooted_manifest() -> crate::protocol::manifest::Manifest {
+        use crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE;
+        use crate::protocol::manifest::{FileEntry, Manifest};
+        Manifest {
+            block_size: DEFAULT_BLOCK_SIZE,
+            root: Some("photos".to_string()),
+            pool: vec![[0u8; 32]],
+            files: vec![FileEntry {
+                path: "photos/a.txt".to_string(),
+                size: 1,
+                mode: None,
+                mtime_ns: None,
+                chunks: vec![0],
+            }],
+        }
+    }
+
+    #[test]
+    fn build_shared_strips_recorded_root() {
+        let manifest = rooted_manifest();
+        let shared = build_shared(&manifest, std::path::Path::new("/srv/share/photos"), None)
+            .expect("build must succeed");
+        let locs = &shared.blocks[&[0u8; 32]];
+        assert_eq!(locs.len(), 1);
+        // Without stripping, this would be .../photos/photos/a.txt.
+        assert_eq!(
+            locs[0].abs,
+            std::path::PathBuf::from("/srv/share/photos/a.txt")
+        );
+    }
+
+    #[test]
+    fn build_shared_rejects_path_outside_root() {
+        let mut manifest = rooted_manifest();
+        manifest.files[0].path = "other/a.txt".to_string();
+        assert!(build_shared(&manifest, std::path::Path::new("/srv/share/photos"), None).is_err());
+    }
 
     #[test]
     fn identical_strings_are_equal() {

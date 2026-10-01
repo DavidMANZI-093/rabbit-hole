@@ -6,7 +6,7 @@ use crate::{
     error,
     fs::system_time_from_ns,
     info,
-    protocol::manifest::{CURRENT, Manifest, common::hex_encode, v1::MAGIC},
+    protocol::manifest::{CURRENT, Manifest, common::ManifestError, common::hex_encode, v1::MAGIC},
     utils::progress::{FetchProgress, format_bytes},
     warn,
 };
@@ -281,8 +281,8 @@ pub async fn pull_manifest(
                         .map_err(|e| format!("read manifest body: {e}"))?;
                     let wire_len = bytes.len() as u64;
                     let bytes = bytes.to_vec();
-                    let manifest = crate::protocol::manifest::decode(&bytes)
-                        .map_err(|e| format!("decode manifest: {e}"))?;
+                    let manifest =
+                        crate::protocol::manifest::decode(&bytes).map_err(decode_error)?;
 
                     return Ok((manifest, wire_len));
                 }
@@ -304,6 +304,17 @@ pub async fn pull_manifest(
     }
 
     Err(last_err)
+}
+
+// Decode failure as a user-facing error. Version mismatch names the
+// remedy (upgrade); everything else reports the parse failure..
+fn decode_error(e: ManifestError) -> String {
+    match e {
+        ManifestError::UnsupportedVersion(v) => {
+            format!("share uses manifest v{v} (needs newer rh — upgrade and retry)")
+        }
+        e => format!("decode manifest: {e}"),
+    }
 }
 
 fn prepare_dest(dest: &Path, force: bool) -> Result<(), String> {
@@ -357,6 +368,68 @@ async fn fetch_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- decode_error ---
+
+    #[test]
+    fn upgrade_message_names_version() {
+        let msg = decode_error(ManifestError::UnsupportedVersion(2));
+        assert!(msg.contains('2'), "unexpected message: {msg}");
+        assert!(msg.contains("newer rh"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn other_decode_errors_report_parse_failure() {
+        let msg = decode_error(ManifestError::BadMagic);
+        assert!(
+            msg.starts_with("decode manifest:"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    // --- fail-closed fetch ---
+
+    #[tokio::test]
+    async fn garbage_manifest_fails_before_touching_dest() {
+        // Stub origin serving 3 non-manifest bytes behind a valid envelope.
+        // Decode failure returns via `?` immediately (no retry backoff).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nXYZ",
+                    )
+                    .await;
+            }
+        });
+        let dest =
+            std::env::temp_dir().join(format!("rh-failclosed-{}-{port}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+
+        let progress = FetchProgress::new(1);
+        let err = match fetch(
+            &format!("http://127.0.0.1:{port}"),
+            &dest,
+            MIN_TIMEOUT_MS,
+            None,
+            false,
+            1,
+            &progress,
+        )
+        .await
+        {
+            Ok(_) => panic!("expected decode failure"),
+            Err(e) => e,
+        };
+        assert!(err.contains("decode manifest"), "unexpected error: {err}");
+        assert!(!dest.exists(), "dest must stay untouched on decode failure");
+        let _ = std::fs::remove_dir_all(&dest);
+    }
 
     // --- normalize_base ---
 

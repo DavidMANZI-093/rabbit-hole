@@ -169,5 +169,6 @@ pub fn decode(input: &[u8]) -> Result<Manifest, ManifestError> {
         block_size,
         pool,
         files,
+        root: None,
     })
 }
