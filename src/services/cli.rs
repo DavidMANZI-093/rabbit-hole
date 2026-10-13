@@ -30,8 +30,8 @@ pub enum Cmd {
         secure: bool,
         #[arg(long, short, default_value = COMPILED_EDGE_BASE)]
         edge: String,
-        #[arg(long)]
-        no_color: bool,
+        // #[arg(long)]
+        // no_color: bool,
         #[arg(long, short)]
         verbose: bool,
     },
@@ -49,13 +49,10 @@ pub enum Cmd {
         concurrency: u8,
         #[arg(long, short, default_value = COMPILED_EDGE_BASE)]
         edge: String,
-        #[arg(long)]
-        no_color: bool,
+        // #[arg(long)]
+        // no_color: bool,
         #[arg(long, short)]
         verbose: bool,
     },
-    Check {
-        #[arg(long)]
-        no_color: bool,
-    },
+    Check,
 }

@@ -1,5 +1,7 @@
 use std::fmt;
 
+pub const SOURCE_PAGE: &str = "https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/";
+
 pub const MIN: CalVer = CalVer {
     year: 2026,
     minor: 5,
@@ -327,5 +329,23 @@ mod tests {
         assert_eq!(exe_dir_path_in(&exedir), Some(side_bin));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn source_page_resolves_ok() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("failed to build HTTP CLient");
+        let res = client
+            .get(SOURCE_PAGE)
+            .send()
+            .await
+            .unwrap_or_else(|_| panic!("failed to GET '{SOURCE_PAGE}'"));
+        assert!(
+            res.status().is_success(),
+            "SOURCE_PAGE returned {}",
+            res.status()
+        );
     }
 }

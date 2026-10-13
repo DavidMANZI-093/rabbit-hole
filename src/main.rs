@@ -4,8 +4,10 @@ use rabbit_hole::services::{cli::Cli, dispatch};
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = dispatch::run((Cli::parse()).cmd).await {
+    let command = Cli::parse().cmd;
+
+    dispatch::run(command).await.map_err(|e| {
         error!("{}", e);
         std::process::exit(1);
-    };
+    });
 }

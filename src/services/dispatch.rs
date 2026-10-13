@@ -9,11 +9,11 @@ use crate::services::cli::Cmd;
 use crate::services::fetch::fetch;
 use crate::services::serve::build_shared;
 use crate::services::tunnel::{self, Tunnel};
-use crate::utils::log::{self, check_fail, check_ok};
+use crate::utils::log::{self /*, check_fail, check_ok*/};
 use crate::utils::net::{lan_ip, shutdown_signal};
 use crate::utils::progress::{FetchProgress, IngestProgress};
 use crate::utils::ui::{
-    dlabel, print_fetch_summary, print_ingest_summary, print_manifest_line, print_wan_and_fetch,
+    print_fetch_summary, print_ingest_summary, print_manifest_line, print_wan_and_fetch,
     tunnel_spinner,
 };
 use crate::{
@@ -30,10 +30,10 @@ pub async fn run(cmd: Cmd) -> Result<(), String> {
             block_size,
             secure,
             edge,
-            no_color,
+            // no_color,
             verbose,
         } => {
-            log::init_color(no_color);
+            // log::init_color(no_color);
             run_serve(ServeOpts {
                 path,
                 block_size,
@@ -51,10 +51,10 @@ pub async fn run(cmd: Cmd) -> Result<(), String> {
             force,
             concurrency,
             edge,
-            no_color,
+            // no_color,
             verbose,
         } => {
-            log::init_color(no_color);
+            // log::init_color(no_color);
             run_fetch(FetchOpts {
                 code_or_url,
                 dest,
@@ -67,10 +67,7 @@ pub async fn run(cmd: Cmd) -> Result<(), String> {
             })
             .await
         }
-        Cmd::Check { no_color } => {
-            log::init_color(no_color);
-            run_check().await
-        }
+        Cmd::Check => run_check().await,
     }
 }
 
@@ -112,7 +109,7 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
             .await
     });
 
-    eprintln!("  {}  {}", dlabel("LAN"), crate::utils::log::bold(&lan_url));
+    // eprintln!("  {}  {}", dlabel("LAN"), crate::utils::log::bold(&lan_url));
 
     let (wan_url, tunnel, code) = start_tunnel(port, &opts.edge, &opts.path).await;
 
@@ -256,9 +253,6 @@ async fn resolve(code_or_url: &str, edge_base: &str) -> Result<String, String> {
 // ---------- check ----------
 
 async fn run_check() -> Result<(), String> {
-    // Longest label is "cloudflared" (11 chars) → pad to 12 for alignment
-    let lbl = |s: &str| crate::utils::log::dim(&format!("{s:<12}"));
-
     // cloudflared (resolved binary: private prefix, exe dir, or PATH)
     match std::process::Command::new(crate::cloudflared::binary())
         .arg("--version")
@@ -266,52 +260,40 @@ async fn run_check() -> Result<(), String> {
     {
         Ok(out) if out.status.success() => {
             let raw = String::from_utf8_lossy(&out.stdout);
+
+            // Based on the assumption that `cloudflared --version` returns the FIRST line in format,
+            // `cloudflared version YYYY.M.P (built YYYYMMDD-HH:MM:SS)`.
+            // (For YYYY.M.P, see `crate::cloudflared::CalVer`)
             let ver = raw.lines().next().unwrap_or("?").trim().to_string();
-            let verdict =
-                match crate::cloudflared::classify(crate::cloudflared::parse_version(&raw)) {
-                    crate::cloudflared::Verdict::Supported(_) => "supported".to_string(),
-                    crate::cloudflared::Verdict::TooOld(_) => {
-                        format!("too old (need >= {})", crate::cloudflared::MIN)
-                    }
-                    crate::cloudflared::Verdict::Unknown => "version unknown".to_string(),
-                };
+
             let src = if crate::cloudflared::is_bundled() {
                 "bundled"
             } else {
-                "PATH"
+                "in PATH"
             };
-            eprintln!(
-                "  {}  {}   {}   {} ({})",
-                lbl("cloudflared"),
-                ver,
-                check_ok(),
-                verdict,
-                src
-            );
+
+            match crate::cloudflared::classify(crate::cloudflared::parse_version(&raw)) {
+                crate::cloudflared::Verdict::Supported(_) => {
+                    eprintln!("cloudflared: AVAILABLE ({src}) - {ver}");
+                }
+                crate::cloudflared::Verdict::TooOld(v) => {
+                    eprintln!(
+                        "cloudflared: TOO OLD, need >= {} (have {v}) (see {})",
+                        crate::cloudflared::MIN,
+                        crate::cloudflared::SOURCE_PAGE
+                    );
+                }
+                crate::cloudflared::Verdict::Unknown => {
+                    eprintln!("cloudflared: UNKNOWN ({src}) - {ver}");
+                }
+            }
         }
         _ => {
             eprintln!(
-                "  {}  not in PATH   {}   (run: sudo apt install cloudflared)",
-                lbl("cloudflared"),
-                check_fail()
+                "cloudflared: MISSING (see: {})",
+                crate::cloudflared::SOURCE_PAGE
             );
         }
-    }
-
-    // temp dir write
-    let mut probe = std::env::temp_dir();
-    probe.push(format!("rh-check-{}", std::process::id()));
-    match std::fs::write(&probe, b"ok").and_then(|_| std::fs::remove_file(&probe)) {
-        Ok(()) => eprintln!(
-            "  {}  {}   {}",
-            lbl("tmp write"),
-            probe
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            check_ok()
-        ),
-        Err(e) => eprintln!("  {}  {e}   {}", lbl("tmp write"), check_fail()),
     }
 
     Ok(())
