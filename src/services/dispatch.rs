@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error;
 use crate::protocol::manifest::Manifest;
-use crate::report::{print_fetch_summary, print_serve_details};
+use crate::report::{FetchSummary, print_fetch_summary, print_serve_details};
 use crate::utils::net::lan_ip;
 use crate::utils::progress::{FetchProgress, IngestProgress};
 use crate::{
@@ -117,9 +117,9 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
 
 async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
     let url = resolve(&opts.code_or_url, &opts.edge).await?;
-    info!("fetching from: {url}");
+    info!("fetching from {url}");
 
-    let progress = FetchProgress::new(opts.concurrency);
+    let progress = FetchProgress::new();
     let result = fetch(
         &url,
         &opts.dest,
@@ -130,19 +130,21 @@ async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
         &progress,
     )
     .await;
+    let snapshot = progress.snapshot();
     progress.finish_and_clear();
-    let stats = result?;
 
-    print_fetch_summary(
-        stats.files,
-        stats.bytes,
-        stats.blocks,
-        stats.failed,
-        stats.retries,
-        &opts.dest,
-    );
-
-    Ok(())
+    match result {
+        Ok(stats) => {
+            print_fetch_summary(&FetchSummary::ok(&stats), &opts.dest);
+            Ok(())
+        }
+        Err(e) => {
+            if snapshot.started {
+                print_fetch_summary(&FetchSummary::incomplete(&snapshot), &opts.dest);
+            }
+            Err(e)
+        }
+    }
 }
 
 // Resolves `code_or_url` to a full HTTPS URL.

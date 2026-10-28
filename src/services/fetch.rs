@@ -22,7 +22,6 @@ pub struct FetchStats {
     pub bytes: u64,
     pub blocks: usize,
     pub retries: u64,
-    pub failed: usize,
 }
 
 pub async fn fetch(
@@ -87,37 +86,26 @@ pub async fn fetch(
     let bytes_total: u64 = manifest.files.iter().map(|f| f.size).sum();
 
     info!(
-        "manifest file {} ({} B)\n{:7}{} files\n{:7}{}\n{:7}{} blocks\n{:7}protocol {} v{}",
+        "manifest size {}, {}:v{} protocol\nfiles {} ({} total, {} blocks)",
         format_bytes(wire_len),
-        wire_len,
-        "",
-        manifest.files.len(),
-        "",
-        format_bytes(bytes_total),
-        "",
-        n_unique,
-        "",
         std::str::from_utf8(&MAGIC).unwrap_or("?"),
         CURRENT,
+        manifest.files.len(),
+        format_bytes(bytes_total),
+        n_unique,
     );
 
-    progress.begin(
-        manifest
-            .files
-            .iter()
-            .map(|f| (f.path.clone(), f.size))
-            .collect(),
-        n_unique as u64,
-        bytes_total,
-    );
+    progress.begin(manifest.files.len(), n_unique as u64, bytes_total);
 
     let out_files = Arc::new(out_files);
     let base = Arc::new(base);
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1) as usize));
     let mut tasks = Vec::with_capacity(n_unique);
+    let file_sizes: Arc<Vec<u64>> = Arc::new(manifest.files.iter().map(|f| f.size).collect());
 
     for (digest, locs) in block_targets {
         let files = out_files.clone();
+        let sizes = file_sizes.clone();
         let token = bearer.clone();
         let client = client.clone();
         let base = base.clone();
@@ -125,64 +113,42 @@ pub async fn fetch(
         let prog = progress.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
-            let slot = prog.acquire_slot();
-            let primary = locs.first().map(|(fi, _)| *fi);
-            if let Some(fi) = primary {
-                prog.slot_begin(slot, fi);
-            }
             let hex = hex_encode(&digest);
 
-            let mut last_err = "unreachable".to_string();
+            let mut last_err = String::new();
             for attempt in 1..=(1 + RETRIES) {
                 match fetch_block(&client, &base, token.as_deref(), &hex).await {
                     Ok(data) => {
                         if blake3::hash(&data).as_bytes() != &digest {
-                            last_err = format!("hash mismatch for block {hex}");
+                            last_err = format!("block {hex}: hash mismatch");
                         } else {
-                            let mut primary_total = 0u64;
-                            let mut primary_size = 0u64;
                             for (fi, off) in &locs {
-                                let size = prog.file_size(*fi);
-                                let add = (data.len() as u64).min(size.saturating_sub(*off));
-                                let new_total = prog.add_file_bytes(*fi, add);
+                                let add = (data.len() as u64).min(sizes[*fi].saturating_sub(*off));
                                 if let Err(e) =
                                     crate::fs::write_at(&files[*fi], &data[..add as usize], *off)
                                 {
-                                    prog.release_slot(slot);
+                                    prog.inc_failed();
                                     return Err(format!("write block {hex} at {off}: {e}"));
-                                }
-                                if Some(*fi) == primary {
-                                    primary_total = new_total;
-                                    primary_size = size;
                                 }
                             }
                             prog.add_bytes(data.len() as u64);
                             prog.inc_blocks();
-                            if let Some(fi) = primary {
-                                if primary_total >= primary_size {
-                                    prog.slot_done(slot, fi);
-                                } else {
-                                    prog.slot_progress(slot, fi);
-                                }
-                            }
-                            prog.release_slot(slot);
                             return Ok::<(), String>(());
                         }
                     }
-                    Err(e) => last_err = e,
+                    Err(BlockError::Fatal(e)) => {
+                        last_err = e;
+                        break;
+                    }
+                    Err(BlockError::Retryable(e)) => last_err = e,
                 }
                 if attempt <= RETRIES {
                     prog.inc_retries();
-                    if let Some(fi) = primary {
-                        prog.slot_retry(slot, fi, attempt + 1);
-                    }
                     tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
                 }
             }
             prog.inc_failed();
-            prog.slot_failed(slot, &hex, &last_err);
-            prog.release_slot(slot);
-            Err(format!("block {hex}: {last_err}"))
+            Err(last_err)
         }));
     }
 
@@ -199,6 +165,7 @@ pub async fn fetch(
             }
             Err(e) => {
                 failed += 1;
+                progress.inc_failed();
                 if err_lines.len() < 5 {
                     err_lines.push(format!("task panicked: {e}"));
                 }
@@ -244,8 +211,7 @@ pub async fn fetch(
         files: manifest.files.len(),
         bytes: bytes_total,
         blocks: n_unique,
-        retries: progress.retries(),
-        failed: 0,
+        retries: progress.snapshot().retries,
     })
 }
 
@@ -342,12 +308,17 @@ fn prepare_dest(dest: &Path, force: bool) -> Result<(), String> {
     Ok(())
 }
 
+enum BlockError {
+    Retryable(String),
+    Fatal(String),
+}
+
 async fn fetch_block(
     client: &reqwest::Client,
     base: &str,
     token: Option<&str>,
     hex: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, BlockError> {
     let mut req = client.get(format!("{base}/__rh__/block/{hex}"));
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {t}"));
@@ -356,12 +327,20 @@ async fn fetch_block(
     let res = req
         .send()
         .await
-        .map_err(|e| format!("GET block {hex}: {e}"))?;
+        .map_err(|e| BlockError::Retryable(format!("block {hex}: {e}")))?;
     match res.status() {
-        s if s.is_success() => Ok(res.bytes().await.map_err(|e| e.to_string())?.to_vec()),
-        s if s.as_u16() == 401 => Err(format!("block {hex}: 401 — wrong --token")),
-        s if s.as_u16() == 404 => Err(format!("block {hex}: unknown to sender")),
-        s => Err(format!("block {hex}: edge returned {s}")),
+        s if s.is_success() => res
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| BlockError::Retryable(format!("block {hex}: read body: {e}"))),
+        s if s.as_u16() == 401 => Err(BlockError::Fatal(format!(
+            "block {hex}: 401 — wrong --token"
+        ))),
+        s if s.as_u16() == 404 => Err(BlockError::Fatal(format!("block {hex}: unknown to sender"))),
+        s => Err(BlockError::Retryable(format!(
+            "block {hex}: edge returned {s}"
+        ))),
     }
 }
 
@@ -411,7 +390,7 @@ mod tests {
             std::env::temp_dir().join(format!("rh-failclosed-{}-{port}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dest);
 
-        let progress = FetchProgress::new(1);
+        let progress = FetchProgress::new();
         let err = match fetch(
             &format!("http://127.0.0.1:{port}"),
             &dest,

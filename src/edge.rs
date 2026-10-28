@@ -7,8 +7,6 @@ use std::{
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
-use crate::info;
-
 pub const DEFUALT_TTL_SECS: u16 = 4 * 3600; // 14,400 seconds — 4 hours
 pub const ROLL_ATTEMPTS: u8 = 8;
 pub const CODE_LEN: u8 = 6;
