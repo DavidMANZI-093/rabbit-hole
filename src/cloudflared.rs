@@ -96,6 +96,24 @@ pub fn probe() -> Verdict {
     }
 }
 
+pub fn command(origin: &str) -> tokio::process::Command {
+    let compat = match probe() {
+        Verdict::TooOld(v) => {
+            crate::warn!("cloudflared version is old, need >= {} (have {v})", MIN);
+            true
+        }
+        _ => false,
+    };
+
+    let mut cmd = tokio::process::Command::new(binary());
+    cmd.arg("tunnel").arg("--no-autoupdate");
+    if !compat {
+        cmd.arg("--no-prechecks");
+    }
+    cmd.args(["--metrics", "localhost:0", "--url", origin]);
+    cmd
+}
+
 // ---------- binary resolution ----------
 
 // Executable file name for this platform.

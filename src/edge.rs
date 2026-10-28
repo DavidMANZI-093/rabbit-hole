@@ -7,6 +7,8 @@ use std::{
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
+use crate::info;
+
 pub const DEFUALT_TTL_SECS: u16 = 4 * 3600; // 14,400 seconds — 4 hours
 pub const ROLL_ATTEMPTS: u8 = 8;
 pub const CODE_LEN: u8 = 6;
@@ -223,6 +225,20 @@ pub async fn try_claim_remembered(
     }
 }
 
+pub async fn remember_code(
+    edge_base: &str,
+    wan_url: Option<&str>,
+    serve_path: &Path,
+) -> Option<String> {
+    let url = wan_url?;
+    if edge_base.is_empty() {
+        return None;
+    }
+    let memory = memory_path_for(serve_path);
+    let code = try_claim_remembered(edge_base, url, DEFUALT_TTL_SECS, &memory).await?;
+    Some(code)
+}
+
 // Best-effort release — warns on failure, never panics.
 pub async fn try_release(client: &EdgeClient, code: &str) {
     if let Err(e) = client.release(code).await {
@@ -305,7 +321,10 @@ mod tests {
         for _ in 0..64 {
             let code = roll_code();
             assert_eq!(code.len(), CODE_LEN as usize, "wrong length: {code}");
-            assert!(code.chars().all(|c| c.is_ascii_hexdigit()), "non-hex: {code}");
+            assert!(
+                code.chars().all(|c| c.is_ascii_hexdigit()),
+                "non-hex: {code}"
+            );
             assert_eq!(code, code.to_lowercase(), "not lowercase: {code}");
         }
     }
@@ -349,7 +368,10 @@ mod tests {
         assert!(name.starts_with("code-"), "unexpected name: {name}");
         let suffix = &name["code-".len()..];
         assert_eq!(suffix.len(), 16, "hash suffix wrong length: {suffix}");
-        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "non-hex suffix: {suffix}");
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "non-hex suffix: {suffix}"
+        );
     }
 
     // --- state_dir XDG logic ---
@@ -378,5 +400,29 @@ mod tests {
         };
         // relative XDG_STATE_HOME must be ignored; should fall back to HOME
         assert!(dir.starts_with("/home/testuser"), "got: {dir:?}");
+    }
+
+    // --- remember_code early exits ---
+
+    #[tokio::test]
+    async fn remember_code_skips_without_wan_url() {
+        assert!(
+            remember_code("http://edge.invalid", None, Path::new("/tmp/rh-test"))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_code_skips_without_edge_base() {
+        assert!(
+            remember_code(
+                "",
+                Some("https://x.trycloudflare.com"),
+                Path::new("/tmp/rh-test")
+            )
+            .await
+            .is_none()
+        );
     }
 }

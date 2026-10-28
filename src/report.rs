@@ -16,7 +16,6 @@ pub fn print_serve_details(
 ) {
     if let Some(wan_url) = wan {
         let tab_n_align = |name: &str, value: &str| -> String { format!("    {name:>7}: {value}") };
-        info!("");
         info!("{}", tab_n_align("url", wan_url));
         if show_local {
             info!("{}", tab_n_align("local", lan));
@@ -62,7 +61,7 @@ pub fn print_serve_details(
     info!("");
     info!("fetch with, {}", fetch_cmd);
     info!("");
-    info!("press Ctrl+C to stop serving.");
+    info!("press Ctrl-C to stop serving.");
 }
 
 pub fn print_fetch_summary(

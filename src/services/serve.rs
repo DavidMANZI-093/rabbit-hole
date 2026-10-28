@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::HashMap, io, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -12,148 +8,99 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use rand::Rng;
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
-use crate::protocol::{self, manifest::Manifest};
+use crate::{
+    services::share::{BlockError, Shared},
+    utils::signal::shutdown_signal,
+};
 
-#[derive(Clone)]
-pub struct Locator {
-    pub abs: PathBuf,
-    pub offset: u64,
-    pub len: u32,
+const GRACE: Duration = Duration::from_secs(5);
+
+// ---------- lifecycle ----------
+
+pub struct Server {
+    port: u16,
+    stop: Option<oneshot::Sender<()>>,
+    handle: JoinHandle<io::Result<()>>,
 }
 
-pub struct DirFile {
-    pub rel: String,
-    pub size: u64,
-}
+impl Server {
+    pub async fn bind(shared: Arc<Shared>) -> Result<Self, String> {
+        let app = router(shared);
+        let listener = TcpListener::bind(("0.0.0.0", 0u16))
+            .await
+            .map_err(|e| format!("bind: {e}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| format!("local addr: {e}"))?
+            .port();
 
-pub enum Kind {
-    Single {
-        abs: PathBuf,
-        name: String,
-        size: u64,
-    },
-    Dir {
-        root: PathBuf,
-        files: Vec<DirFile>,
-    },
-}
+        let (stop, stopped) = oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    stopped.await.ok();
+                })
+                .await
+        });
 
-pub struct Shared {
-    pub manifest_bytes: Vec<u8>,
-    pub etag: String,
-    pub kind: Kind,
-    pub blocks: HashMap<[u8; 32], Arc<Vec<Locator>>>,
-    pub token: Option<String>,
-}
+        Ok(Self {
+            port,
+            stop: Some(stop),
+            handle,
+        })
+    }
 
-pub fn build_shared(
-    manifest: &Manifest,
-    src: &Path,
-    token: Option<String>,
-) -> Result<Arc<Shared>, String> {
-    // Validate before encoding: 'encode()' debug-asserts validity, which
-    // panics in debug builds instead of returning Err on corrupt input.
-    manifest
-        .validate()
-        .map_err(|e| format!("invalid manifest: {e}"))?;
+    pub fn port(&self) -> u16 {
+        self.port
+    }
 
-    let manifest_bytes = protocol::manifest::encode(manifest);
-    let etag = blake3::hash(&manifest_bytes).to_hex().to_string();
-    let bs = manifest.block_size as u64;
-    let single = src.is_file();
-
-    let mut blocks_build: HashMap<[u8; 32], Vec<Locator>> = HashMap::new();
-    let root_prefix: Option<String> = manifest.root.clone().map(|r| format!("{r}/"));
-    for f in &manifest.files {
-        let rel = match &root_prefix {
-            Some(prefix) => f.path.strip_prefix(prefix.as_str()).ok_or_else(|| {
-                format!(
-                    "manifest path {} outside root {}",
-                    f.path,
-                    manifest.root.as_deref().unwrap_or("?")
-                )
-            })?,
-            None => f.path.as_str(),
+    // Waits for Ctrl-C/SIGTERM or an early server exit, then drains for
+    // `GRACE` and aborts if the server is still running.
+    pub async fn run_until_shutdown(mut self) -> Result<(), String> {
+        let early = tokio::select! {
+            _ = shutdown_signal() => None,
+            r = &mut self.handle => Some(r),
         };
-        let abs = if single {
-            src.to_path_buf()
-        } else {
-            src.join(rel)
-        };
+        if let Some(r) = early {
+            return join(r);
+        }
 
-        for (j, idx) in f.chunks.iter().enumerate() {
-            let digest = manifest.pool[*idx as usize];
-            let offset = j as u64 * bs;
-            let len = bs.min(f.size.saturating_sub(offset)) as u32;
-
-            blocks_build.entry(digest).or_default().push(Locator {
-                abs: abs.clone(),
-                offset,
-                len,
-            });
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        match tokio::time::timeout(GRACE, &mut self.handle).await {
+            Ok(r) => join(r),
+            Err(_) => {
+                self.handle.abort();
+                let _ = (&mut self.handle).await;
+                Err(format!(
+                    "server did not stop within {}s; aborted",
+                    GRACE.as_secs()
+                ))
+            }
         }
     }
-    let blocks: HashMap<[u8; 32], Arc<Vec<Locator>>> = blocks_build
-        .into_iter()
-        .map(|(k, v)| (k, Arc::new(v)))
-        .collect();
-
-    let kind = if single {
-        let entry = manifest
-            .files
-            .first()
-            .ok_or("single-file manifest must contain exactly one file")?;
-        if manifest.files.len() != 1 {
-            return Err("single-file share expects exactly one manifest entry".into());
-        }
-
-        let live = crate::fs::metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
-        if live.kind != crate::fs::Kind::File {
-            return Err(format!("refusing non-file {}", src.display()));
-        }
-        if live.size != entry.size {
-            return Err(format!(
-                "source changed since ingest (manifest {} B, disk {} B): re-share",
-                entry.size, live.size
-            ));
-        }
-
-        let name = src
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("download")
-            .to_string();
-        Kind::Single {
-            abs: src.to_path_buf(),
-            name,
-            size: entry.size,
-        }
-    } else {
-        Kind::Dir {
-            root: src.to_path_buf(),
-            files: manifest
-                .files
-                .iter()
-                .map(|f| DirFile {
-                    rel: f.path.clone(),
-                    size: f.size,
-                })
-                .collect(),
-        }
-    };
-
-    Ok(Arc::new(Shared {
-        manifest_bytes,
-        etag,
-        kind,
-        blocks,
-        token,
-    }))
 }
 
-pub fn router(shared: Arc<Shared>) -> Router {
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+fn join(r: Result<io::Result<()>, tokio::task::JoinError>) -> Result<(), String> {
+    match r {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("server error: {e}")),
+        Err(e) => Err(format!("server task panicked: {e}")),
+    }
+}
+
+// ---------- routing ----------
+
+fn router(shared: Arc<Shared>) -> Router {
     Router::new()
         .route("/__rh__/manifest", get(h_manifest))
         .route("/__rh__/block/{:hash}", get(h_block))
@@ -192,11 +139,7 @@ async fn h_block(
         Ok(h) => h,
         Err(_) => return (StatusCode::BAD_REQUEST, "bad block hash\n").into_response(),
     };
-    let Some(cands) = s.blocks.get(&want) else {
-        return (StatusCode::NOT_FOUND, "unknown block\n").into_response();
-    };
-    let cands = cands.clone(); // Arc clone — O(1)
-    match tokio::task::spawn_blocking(move || read_verified_block(&want, &cands)).await {
+    match tokio::task::spawn_blocking(move || s.read_block(&want)).await {
         Ok(Ok(bytes)) => Response::builder()
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header(header::CONTENT_LENGTH, bytes.len().to_string())
@@ -205,7 +148,8 @@ async fn h_block(
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "build failed\n").into_response()
             }),
-        Ok(Err(e)) => (
+        Ok(Err(BlockError::Unknown)) => (StatusCode::NOT_FOUND, "unknown block\n").into_response(),
+        Ok(Err(BlockError::Failed(e))) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("block read failed: {e}\n"),
         )
@@ -214,38 +158,7 @@ async fn h_block(
     }
 }
 
-fn read_verified_block(want: &[u8; 32], cands: &[Locator]) -> Result<Vec<u8>, String> {
-    for loc in cands {
-        let f = match std::fs::File::open(&loc.abs) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let mut buf = vec![0u8; loc.len as usize];
-        let mut off = 0;
-        while off < buf.len() {
-            match crate::fs::read_at(&f, &mut buf[off..], loc.offset + off as u64) {
-                Ok(0) => break,
-                Ok(n) => off += n,
-                Err(_) => break,
-            }
-        }
-        if off != buf.len() {
-            continue;
-        }
-        if blake3::hash(&buf).as_bytes() == want {
-            return Ok(buf);
-        }
-    }
-    Err("block failed verification (source changed on disk?)".into())
-}
-
 // ---------- auth ----------
-
-pub fn generate_token() -> String {
-    let mut buf = [0u8; 32];
-    rand::rng().fill_bytes(&mut buf);
-    crate::protocol::manifest::common::hex_encode(&buf)
-}
 
 fn ct_eq(a: &str, b: &str) -> bool {
     let (x, y) = (a.as_bytes(), b.as_bytes());
@@ -290,44 +203,6 @@ fn bearer_ok(headers: &HeaderMap, q: &HashMap<String, String>, expected: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn rooted_manifest() -> crate::protocol::manifest::Manifest {
-        use crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE;
-        use crate::protocol::manifest::{FileEntry, Manifest};
-        Manifest {
-            block_size: DEFAULT_BLOCK_SIZE,
-            root: Some("photos".to_string()),
-            pool: vec![[0u8; 32]],
-            files: vec![FileEntry {
-                path: "photos/a.txt".to_string(),
-                size: 1,
-                mode: None,
-                mtime_ns: None,
-                chunks: vec![0],
-            }],
-        }
-    }
-
-    #[test]
-    fn build_shared_strips_recorded_root() {
-        let manifest = rooted_manifest();
-        let shared = build_shared(&manifest, std::path::Path::new("/srv/share/photos"), None)
-            .expect("build must succeed");
-        let locs = &shared.blocks[&[0u8; 32]];
-        assert_eq!(locs.len(), 1);
-        // Without stripping, this would be .../photos/photos/a.txt.
-        assert_eq!(
-            locs[0].abs,
-            std::path::PathBuf::from("/srv/share/photos/a.txt")
-        );
-    }
-
-    #[test]
-    fn build_shared_rejects_path_outside_root() {
-        let mut manifest = rooted_manifest();
-        manifest.files[0].path = "other/a.txt".to_string();
-        assert!(build_shared(&manifest, std::path::Path::new("/srv/share/photos"), None).is_err());
-    }
 
     #[test]
     fn identical_strings_are_equal() {

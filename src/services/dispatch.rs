@@ -1,29 +1,24 @@
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
-
-use tokio::net::TcpListener;
+use std::path::{Path, PathBuf};
 
 use crate::error;
+use crate::protocol::manifest::Manifest;
 use crate::report::{print_fetch_summary, print_serve_details};
-use crate::utils::net::{lan_ip, shutdown_signal};
+use crate::utils::net::lan_ip;
 use crate::utils::progress::{FetchProgress, IngestProgress};
 use crate::{
     edge,
     ingest::{IngestStats, ingest},
 };
-use crate::{edge::DEFUALT_TTL_SECS, protocol::manifest::Manifest};
 use crate::{info, warn};
 use crate::{services::cli::Command, utils::format::format_bytes};
 use crate::{services::fetch::fetch, utils::tty::yellow};
 use crate::{
-    services::serve::build_shared,
+    services::share::{build_shared, generate_token},
     utils::tty::{green, purple, red},
 };
 use crate::{
-    services::tunnel::{self, Tunnel},
-    utils::tty::{Dots, bold},
+    services::{serve::Server, tunnel},
+    utils::tty::bold,
 };
 
 pub async fn run(cmd: Command) -> Result<(), String> {
@@ -84,7 +79,7 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
     }
     info!("{}", stats.summary());
 
-    let token = opts.secure.then(crate::services::serve::generate_token);
+    let token = opts.secure.then(generate_token);
     let shared = build_shared(&manifest, &opts.path, token.clone())?;
 
     info!(
@@ -92,108 +87,30 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
         format_bytes(shared.manifest_bytes.len() as u64)
     );
 
-    let app = crate::services::serve::router(shared.clone());
-
-    let listener = TcpListener::bind(("0.0.0.0", 0u16))
-        .await
-        .map_err(|e| format!("bind: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("local addr: {e}"))?
-        .port();
-
+    let server = Server::bind(shared).await?;
+    let port = server.port();
     let lan_url = format!("http://{}:{port}", lan_ip());
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-    let server_handle = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                shutdown_rx.await.ok();
-            })
-            .await
-    });
-
-    let (wan_url, tunnel, code) = start_tunnel(port, &opts.edge, &opts.path).await;
+    let wan = tunnel::start(port).await;
+    let wan_url = wan.as_ref().map(|t| t.url.as_str());
+    let code = edge::remember_code(&opts.edge, wan_url, &opts.path).await;
 
     print_serve_details(
         &lan_url,
-        wan_url.as_deref(),
+        wan_url,
         code.as_deref(),
         token.as_deref(),
         opts.local,
     );
 
-    let mut server_handle = server_handle;
-    tokio::select! {
-        _ = shutdown_signal() => (),
-        r = &mut server_handle => match r {
-            Ok(Ok(())) => {},
-            Ok(Err(e)) => error!("server error: {e}"),
-            Err(e) => error!("server task panicked: {e}"),
-        },
+    if let Err(e) = server.run_until_shutdown().await {
+        error!("{e}");
     }
-
-    let _ = shutdown_tx.send(());
-    tokio::time::timeout(Duration::from_secs(5), &mut server_handle)
-        .await
-        .ok();
-    if !server_handle.is_finished() {
-        server_handle.abort();
-    }
-    if let Some(t) = tunnel {
+    if let Some(t) = wan {
         t.shutdown().await;
     }
 
     Ok(())
-}
-
-// Spawns cloudflared and, if an edge base is configured, registers a short code.
-async fn start_tunnel(
-    port: u16,
-    edge_base: &str,
-    serve_path: &Path,
-) -> (Option<String>, Option<Tunnel>, Option<String>) {
-    let status = Dots::start("requesting tunnel");
-
-    let (url, tunnel) = match tunnel::spawn(port).await {
-        Ok(t) => {
-            t.watch_exit();
-            status.message("resolving dns");
-            let live = t.wait_until_live(|_| {}).await;
-            status.finish();
-            if !live {
-                warn!("tunnel URL not yet reachable at edge — sharing anyway");
-            }
-            (Some(t.url.clone()), Some(t))
-        }
-        Err(tunnel::SpawnError::NotInstalled(e)) => {
-            status.finish();
-            warn!("cloudflared not found ({e}) — LAN only (run: rh check)");
-            (None, None)
-        }
-        Err(tunnel::SpawnError::NoTunnelUrl(e)) => {
-            status.finish();
-            warn!("no tunnel URL ({e}) — LAN only (check your internet connection)");
-            (None, None)
-        }
-    };
-
-    let code = match (url.as_deref(), edge_base.is_empty()) {
-        (Some(url), false) => {
-            let memory = edge::memory_path_for(serve_path);
-            match edge::try_claim_remembered(edge_base, url, DEFUALT_TTL_SECS, &memory).await {
-                Some(c) => {
-                    info!("edge code  {c}  (ttl {DEFUALT_TTL_SECS}s)");
-                    Some(c)
-                }
-                None => None,
-            }
-        }
-        _ => None,
-    };
-
-    (url, tunnel, code)
 }
 
 // ---------- fetch ----------

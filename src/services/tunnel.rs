@@ -1,5 +1,4 @@
 use std::{
-    fmt,
     process::Stdio,
     sync::{
         Arc,
@@ -10,32 +9,46 @@ use std::{
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::warn;
+use crate::{utils::tty::Dots, warn};
 
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(45);
 
-// the "Registered tunnel connection ... protocol=quic" line appears within milliseconds
-// of the URL line — 600ms is generous but cheap to wait
-const PROTOCOL_PEEK: Duration = Duration::from_millis(600);
-
 // Why a tunnel never materialized. Typed so callers blame accurately
 // instead of printing one misleading message for every failure.
 #[derive(Debug)]
-pub enum SpawnError {
+enum SpawnError {
     NotInstalled(String),
     NoTunnelUrl(String),
 }
 
-impl fmt::Display for SpawnError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotInstalled(e) | Self::NoTunnelUrl(e) => write!(f, "{e}"),
+pub async fn start(port: u16) -> Option<Tunnel> {
+    let status = Dots::start("requesting tunnel");
+    match spawn(port).await {
+        Ok(t) => {
+            t.watch_exit();
+            status.message("resolving dns");
+            let live = t.wait_until_live().await;
+            status.finish();
+            if !live {
+                warn!("tunnel URL not yet reachable at edge — sharing anyway");
+            }
+            Some(t)
+        }
+        Err(SpawnError::NotInstalled(e)) => {
+            status.finish();
+            warn!("cloudflared not found ({e}) — LAN only (run: rh check)");
+            None
+        }
+        Err(SpawnError::NoTunnelUrl(e)) => {
+            status.finish();
+            warn!("no tunnel URL ({e}) — LAN only (check your internet connection)");
+            None
         }
     }
 }
 
-pub async fn spawn(port: u16) -> Result<Tunnel, SpawnError> {
+async fn spawn(port: u16) -> Result<Tunnel, SpawnError> {
     if !crate::utils::net::has_internet().await {
         return Err(SpawnError::NoTunnelUrl(
             "no internet route to Cloudflare (1.1.1.1:443 unreachable)".to_string(),
@@ -44,31 +57,7 @@ pub async fn spawn(port: u16) -> Result<Tunnel, SpawnError> {
 
     let origin = format!("http://127.0.0.1:{port}");
 
-    // `--no-prechecks` needs cloudflared >= MIN (TUN-10387, 2026.5.0).
-    // Older binaries get the compat arg set (prechecks cost ~6s but WAN works).
-    // Unknown versions get full args; can't punish what we can't classify.
-    let mut compat = false;
-    if let crate::cloudflared::Verdict::TooOld(v) = crate::cloudflared::probe() {
-        warn!(
-            "cloudflared version is old, need >= {} (have {v})",
-            crate::cloudflared::MIN
-        );
-        compat = true;
-    }
-
-    let mut cmd = tokio::process::Command::new(crate::cloudflared::binary());
-    cmd.arg("tunnel").arg("--no-autoupdate");
-    if !compat {
-        cmd.arg("--no-prechecks"); // skip post-connection diagnostic table (~6s wasted otherwise)
-    }
-    cmd.args([
-        "--metrics",
-        "localhost:0", // random port — avoids conflicts with existing instances
-        "--url",
-        &origin,
-    ]);
-
-    let mut child = cmd
+    let mut child = crate::cloudflared::command(&origin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -102,27 +91,12 @@ pub async fn spawn(port: u16) -> Result<Tunnel, SpawnError> {
         SpawnError::NoTunnelUrl("timed out waiting for cloudflared URL (60s)".to_string())
     })??;
 
-    // Phase 2: peek briefly for the protocol log line which follows immediately
-    // e.g. "Registered tunnel connection connIndex=0 ... protocol=quic"
-    let protocol: Option<String> = tokio::time::timeout(PROTOCOL_PEEK, async {
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Some(p) = sniff_protocol(&line) {
-                return Some(p);
-            }
-        }
-        None
-    })
-    .await
-    .ok()
-    .flatten();
-
     tokio::spawn(async move { while lines.next_line().await.ok().flatten().is_some() {} });
 
     Ok(Tunnel {
         child: Arc::new(tokio::sync::Mutex::new(child)),
         dismissed: Arc::new(AtomicBool::new(false)),
         url,
-        protocol,
     })
 }
 
@@ -130,7 +104,6 @@ pub struct Tunnel {
     child: Arc<tokio::sync::Mutex<tokio::process::Child>>,
     dismissed: Arc<AtomicBool>,
     pub url: String,
-    pub protocol: Option<String>,
 }
 
 impl Tunnel {
@@ -143,10 +116,7 @@ impl Tunnel {
         let _ = child.wait().await;
     }
 
-    pub async fn wait_until_live<F>(&self, on_status: F) -> bool
-    where
-        F: Fn(&str),
-    {
+    async fn wait_until_live(&self) -> bool {
         let probe = format!("{}/__rh__/health", self.url);
         let host = self
             .url
@@ -167,8 +137,6 @@ impl Tunnel {
                 if !state.addrs.is_empty() {
                     builder = builder.resolve_to_addrs(&host, &state.addrs);
                 }
-            } else {
-                on_status("activating...");
             }
 
             if let Ok(client) = builder.build()
@@ -184,7 +152,7 @@ impl Tunnel {
         false
     }
 
-    pub fn watch_exit(&self) {
+    fn watch_exit(&self) {
         let child = self.child.clone();
         let dismissed = self.dismissed.clone();
         let url = self.url.clone();
@@ -226,17 +194,6 @@ fn sniff_url(line: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn sniff_protocol(line: &str) -> Option<String> {
-    // matches "protocol=quic" or "protocol=http2" in cloudflared log lines
-    let pos = line.find("protocol=")?;
-    let rest = &line[pos + "protocol=".len()..];
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c == '"' || c == ',')
-        .unwrap_or(rest.len());
-    let proto = &rest[..end];
-    matches!(proto, "quic" | "http2" | "http3").then(|| proto.to_string())
 }
 
 #[cfg(test)]
@@ -297,37 +254,5 @@ mod tests {
             sniff_url(line),
             Some("https://my-tunnel.trycloudflare.com".to_string())
         );
-    }
-
-    // --- sniff_protocol ---
-
-    #[test]
-    fn extracts_quic_protocol() {
-        let line = "2026-09-22T06:40:16Z INF Registered tunnel connection connIndex=0 connection=abc event=0 ip=1.2.3.4 location=nbo04 protocol=quic";
-        assert_eq!(sniff_protocol(line), Some("quic".to_string()));
-    }
-
-    #[test]
-    fn extracts_http2_protocol() {
-        let line = "Registered tunnel connection protocol=http2 connIndex=0";
-        assert_eq!(sniff_protocol(line), Some("http2".to_string()));
-    }
-
-    #[test]
-    fn rejects_unknown_protocol_value() {
-        let line = "protocol=http1";
-        assert_eq!(sniff_protocol(line), None);
-    }
-
-    #[test]
-    fn returns_none_for_line_without_protocol_key() {
-        let line = "Registered tunnel connection connIndex=0";
-        assert_eq!(sniff_protocol(line), None);
-    }
-
-    #[test]
-    fn stops_at_space_after_protocol_value() {
-        let line = "protocol=quic connIndex=0";
-        assert_eq!(sniff_protocol(line), Some("quic".to_string()));
     }
 }
