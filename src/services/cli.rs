@@ -16,11 +16,18 @@ use crate::{
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub cmd: Cmd,
+    pub cmd: Command,
+
+    #[arg(long)]
+    pub no_color: bool,
+
+    /// Enable debug logging.
+    #[arg(short = 'v', long = "verbose", global = true)]
+    pub verbose: bool,
 }
 
 #[derive(Subcommand)]
-pub enum Cmd {
+pub enum Command {
     Serve {
         path: PathBuf,
 
@@ -30,10 +37,8 @@ pub enum Cmd {
         secure: bool,
         #[arg(long, short, default_value = COMPILED_EDGE_BASE)]
         edge: String,
-        // #[arg(long)]
-        // no_color: bool,
         #[arg(long, short)]
-        verbose: bool,
+        local: bool,
     },
     Fetch {
         code_or_url: String,
@@ -49,10 +54,6 @@ pub enum Cmd {
         concurrency: u8,
         #[arg(long, short, default_value = COMPILED_EDGE_BASE)]
         edge: String,
-        // #[arg(long)]
-        // no_color: bool,
-        #[arg(long, short)]
-        verbose: bool,
     },
     Check,
 }

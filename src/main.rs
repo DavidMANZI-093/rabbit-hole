@@ -1,12 +1,15 @@
 use clap::Parser;
 use rabbit_hole::error;
 use rabbit_hole::services::{cli::Cli, dispatch};
+use rabbit_hole::utils::{log, tty};
 
 #[tokio::main]
 async fn main() {
-    let command = Cli::parse().cmd;
+    let cli = Cli::parse();
+    log::set_verbose(cli.verbose);
+    tty::init(cli.no_color);
 
-    dispatch::run(command).await.map_err(|e| {
+    dispatch::run(cli.cmd).await.map_err(|e| {
         error!("{}", e);
         std::process::exit(1);
     });

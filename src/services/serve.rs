@@ -53,7 +53,7 @@ pub fn build_shared(
     src: &Path,
     token: Option<String>,
 ) -> Result<Arc<Shared>, String> {
-    // Validate before encoding: encode() debug-asserts validity, which
+    // Validate before encoding: 'encode()' debug-asserts validity, which
     // panics in debug builds instead of returning Err on corrupt input.
     manifest
         .validate()

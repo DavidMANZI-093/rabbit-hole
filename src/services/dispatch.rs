@@ -5,45 +5,46 @@ use std::{
 
 use tokio::net::TcpListener;
 
-use crate::services::cli::Cmd;
-use crate::services::fetch::fetch;
-use crate::services::serve::build_shared;
-use crate::services::tunnel::{self, Tunnel};
-use crate::utils::log::{self /*, check_fail, check_ok*/};
+use crate::error;
+use crate::report::{print_fetch_summary, print_serve_details};
 use crate::utils::net::{lan_ip, shutdown_signal};
 use crate::utils::progress::{FetchProgress, IngestProgress};
-use crate::utils::ui::{
-    print_fetch_summary, print_ingest_summary, print_manifest_line, print_wan_and_fetch,
-    tunnel_spinner,
-};
 use crate::{
     edge,
     ingest::{IngestStats, ingest},
 };
 use crate::{edge::DEFUALT_TTL_SECS, protocol::manifest::Manifest};
 use crate::{info, warn};
+use crate::{services::cli::Command, utils::format::format_bytes};
+use crate::{services::fetch::fetch, utils::tty::yellow};
+use crate::{
+    services::serve::build_shared,
+    utils::tty::{green, purple, red},
+};
+use crate::{
+    services::tunnel::{self, Tunnel},
+    utils::tty::{Dots, bold},
+};
 
-pub async fn run(cmd: Cmd) -> Result<(), String> {
+pub async fn run(cmd: Command) -> Result<(), String> {
     match cmd {
-        Cmd::Serve {
+        Command::Serve {
             path,
             block_size,
             secure,
+            local,
             edge,
-            // no_color,
-            verbose,
         } => {
-            // log::init_color(no_color);
             run_serve(ServeOpts {
                 path,
                 block_size,
                 secure,
+                local,
                 edge,
-                verbose,
             })
             .await
         }
-        Cmd::Fetch {
+        Command::Fetch {
             code_or_url,
             dest,
             timeout,
@@ -51,8 +52,6 @@ pub async fn run(cmd: Cmd) -> Result<(), String> {
             force,
             concurrency,
             edge,
-            // no_color,
-            verbose,
         } => {
             // log::init_color(no_color);
             run_fetch(FetchOpts {
@@ -63,29 +62,35 @@ pub async fn run(cmd: Cmd) -> Result<(), String> {
                 force,
                 concurrency,
                 edge,
-                verbose,
             })
             .await
         }
-        Cmd::Check => run_check().await,
+        Command::Check => run_check().await,
     }
 }
 
 // ---------- serve ----------
 
 async fn run_serve(opts: ServeOpts) -> Result<(), String> {
-    log::set_verbose(opts.verbose);
-
-    let progress = IngestProgress::new();
+    let progress = IngestProgress::new(&opts.path);
     let (manifest, stats) = ingest_blocking(&opts.path, opts.block_size, progress.clone()).await?;
     progress.finish_and_clear();
 
-    print_ingest_summary(&stats);
+    if stats.skipped > 0 {
+        warn!(
+            "skipped {} entries, rerun with '--verbose' for reasons",
+            stats.skipped
+        );
+    }
+    info!("{}", stats.summary());
 
     let token = opts.secure.then(crate::services::serve::generate_token);
     let shared = build_shared(&manifest, &opts.path, token.clone())?;
 
-    print_manifest_line(shared.manifest_bytes.len() as u64);
+    info!(
+        "manifest size {}\n",
+        format_bytes(shared.manifest_bytes.len() as u64)
+    );
 
     let app = crate::services::serve::router(shared.clone());
 
@@ -109,24 +114,23 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
             .await
     });
 
-    // eprintln!("  {}  {}", dlabel("LAN"), crate::utils::log::bold(&lan_url));
-
     let (wan_url, tunnel, code) = start_tunnel(port, &opts.edge, &opts.path).await;
 
-    print_wan_and_fetch(
+    print_serve_details(
         &lan_url,
         wan_url.as_deref(),
         code.as_deref(),
         token.as_deref(),
+        opts.local,
     );
 
     let mut server_handle = server_handle;
     tokio::select! {
-        _ = shutdown_signal() => eprintln!("\n  signal: shutting down"),
+        _ = shutdown_signal() => (),
         r = &mut server_handle => match r {
             Ok(Ok(())) => {},
-            Ok(Err(e)) => eprintln!("  server error: {e}"),
-            Err(e) => eprintln!("  server task panicked: {e}"),
+            Ok(Err(e)) => error!("server error: {e}"),
+            Err(e) => error!("server task panicked: {e}"),
         },
     }
 
@@ -140,7 +144,6 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
     if let Some(t) = tunnel {
         t.shutdown().await;
     }
-    eprintln!("  bye.");
 
     Ok(())
 }
@@ -151,31 +154,26 @@ async fn start_tunnel(
     edge_base: &str,
     serve_path: &Path,
 ) -> (Option<String>, Option<Tunnel>, Option<String>) {
-    let spinner = tunnel_spinner();
-    spinner.set_message("requesting...");
+    let status = Dots::start("requesting tunnel");
 
     let (url, tunnel) = match tunnel::spawn(port).await {
         Ok(t) => {
             t.watch_exit();
-            let url_clone = t.url.clone();
-            let live = t
-                .wait_until_live(|msg| {
-                    spinner.set_message(format!("{url_clone}  {msg}"));
-                })
-                .await;
-            spinner.finish_and_clear();
+            status.message("resolving dns");
+            let live = t.wait_until_live(|_| {}).await;
+            status.finish();
             if !live {
                 warn!("tunnel URL not yet reachable at edge — sharing anyway");
             }
             (Some(t.url.clone()), Some(t))
         }
         Err(tunnel::SpawnError::NotInstalled(e)) => {
-            spinner.finish_and_clear();
+            status.finish();
             warn!("cloudflared not found ({e}) — LAN only (run: rh check)");
             (None, None)
         }
         Err(tunnel::SpawnError::NoTunnelUrl(e)) => {
-            spinner.finish_and_clear();
+            status.finish();
             warn!("no tunnel URL ({e}) — LAN only (check your internet connection)");
             (None, None)
         }
@@ -201,8 +199,6 @@ async fn start_tunnel(
 // ---------- fetch ----------
 
 async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
-    log::set_verbose(opts.verbose);
-
     let url = resolve(&opts.code_or_url, &opts.edge).await?;
     info!("fetching from: {url}");
 
@@ -274,23 +270,31 @@ async fn run_check() -> Result<(), String> {
 
             match crate::cloudflared::classify(crate::cloudflared::parse_version(&raw)) {
                 crate::cloudflared::Verdict::Supported(_) => {
-                    eprintln!("cloudflared: AVAILABLE ({src}) - {ver}");
+                    info!(
+                        "cloudflared: {} ({src}) - {ver}",
+                        bold(green("available").as_str())
+                    );
                 }
                 crate::cloudflared::Verdict::TooOld(v) => {
-                    eprintln!(
-                        "cloudflared: TOO OLD, need >= {} (have {v}) (see {})",
+                    info!(
+                        "cloudflared: {}, need >= {} (have {v}) (see {})",
+                        bold(yellow("too old").as_str()),
                         crate::cloudflared::MIN,
                         crate::cloudflared::SOURCE_PAGE
                     );
                 }
                 crate::cloudflared::Verdict::Unknown => {
-                    eprintln!("cloudflared: UNKNOWN ({src}) - {ver}");
+                    info!(
+                        "cloudflared: {} ({src}) - {ver}",
+                        bold(purple("unknown").as_str())
+                    );
                 }
             }
         }
         _ => {
-            eprintln!(
-                "cloudflared: MISSING (see: {})",
+            info!(
+                "cloudflared: {} (see: {})",
+                bold(red("missing").as_str()),
                 crate::cloudflared::SOURCE_PAGE
             );
         }
@@ -305,8 +309,8 @@ struct ServeOpts {
     path: PathBuf,
     block_size: u32,
     secure: bool,
+    local: bool,
     edge: String,
-    verbose: bool,
 }
 
 struct FetchOpts {
@@ -317,7 +321,6 @@ struct FetchOpts {
     force: bool,
     concurrency: u8,
     edge: String,
-    verbose: bool,
 }
 
 // ---------- helpers ----------

@@ -8,48 +8,21 @@ use std::{
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
+use crate::utils::format::{format_bytes, truncate_path};
+
+// ---------- Serve/Ingest ----------
+
 const STATS_MIN_INTERVAL: Duration = Duration::from_millis(100);
-const STAGE_MIN_INTERVAL: Duration = Duration::from_millis(50);
-const MAX_PATH_WIDTH: usize = 60;
-
-pub enum Phase {
-    Scan,
-    Check,
-    Hash,
-}
-
-impl Phase {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Scan => "scan",
-            Self::Check => "check",
-            Self::Hash => "hash",
-        }
-    }
-}
-
-pub enum SkipReason {
-    WalkError,
-    Symlink,
-    NonFile,
-    StatFailed,
-    BadName,
-}
 
 struct Inner {
-    _mp: MultiProgress,
-    activity: ProgressBar,
-    stats: ProgressBar,
+    source: String,
+    muted: bool,
     files: AtomicUsize,
     total_files: AtomicUsize,
     has_totals: AtomicUsize, // 0 = unknown, 1 = known
     bytes: AtomicU64,
     total_bytes: AtomicU64,
-    blocks_total: AtomicU64,
-    blocks_unique: AtomicU64,
-    skipped: AtomicUsize,
     last_stats: Mutex<Instant>,
-    last_stage: Mutex<(Instant, String)>,
 }
 
 #[derive(Clone)]
@@ -57,76 +30,41 @@ pub struct IngestProgress {
     inner: Arc<Inner>,
 }
 
+impl Default for IngestProgress {
+    fn default() -> Self {
+        Self::new(std::path::Path::new(""))
+    }
+}
+
 impl IngestProgress {
-    pub fn new() -> Self {
-        let animated = crate::utils::log::is_unicode();
-        let ticks: &[&str] = if animated {
-            &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-        } else {
-            &["|", "/", "-", "\\"]
-        };
+    pub fn new(source: &std::path::Path) -> Self {
+        Self::build(
+            truncate_path(&source.display().to_string()).into_owned(),
+            !crate::utils::tty::is_tty(),
+        )
+    }
 
-        let mp = MultiProgress::new();
-        let style = ProgressStyle::with_template("{spinner} {msg}")
-            .expect("progress template")
-            .tick_strings(ticks);
-
-        let activity = mp.add(ProgressBar::new_spinner());
-        activity.set_style(style.clone());
-
-        let stats = mp.add(ProgressBar::new_spinner());
-        stats.set_style(style);
-        if animated {
-            activity.enable_steady_tick(Duration::from_millis(80));
-            stats.enable_steady_tick(Duration::from_millis(80));
-        } else {
-            activity.set_draw_target(indicatif::ProgressDrawTarget::hidden());
-            stats.set_draw_target(indicatif::ProgressDrawTarget::hidden());
-        }
-
-        let now = Instant::now();
+    fn build(source: String, muted: bool) -> Self {
         let this = Self {
             inner: Arc::new(Inner {
-                _mp: mp,
-                activity,
-                stats,
+                source,
+                muted,
                 files: AtomicUsize::new(0),
                 total_files: AtomicUsize::new(0),
                 has_totals: AtomicUsize::new(0),
                 bytes: AtomicU64::new(0),
                 total_bytes: AtomicU64::new(0),
-                blocks_total: AtomicU64::new(0),
-                blocks_unique: AtomicU64::new(0),
-                skipped: AtomicUsize::new(0),
-                last_stats: Mutex::new(now),
-                last_stage: Mutex::new((now, String::new())),
+                last_stats: Mutex::new(Instant::now()),
             }),
         };
         this.refresh_stats_force();
+
         this
     }
 
-    pub fn hidden() -> Self {
-        let this = Self::new();
-        this.inner
-            .activity
-            .set_draw_target(indicatif::ProgressDrawTarget::hidden());
-        this.inner
-            .stats
-            .set_draw_target(indicatif::ProgressDrawTarget::hidden());
-        this
-    }
-
-    pub fn set_stage(&self, phase: Phase, path: &str) {
-        let msg = format!("{} : {}", phase.label(), truncate_path(path));
-        {
-            let mut guard = self.inner.last_stage.lock().expect("stage lock");
-            if !guard.1.is_empty() && guard.0.elapsed() < STAGE_MIN_INTERVAL {
-                return;
-            }
-            *guard = (Instant::now(), msg.clone());
-        }
-        self.inner.activity.set_message(msg);
+    // Only for tests (no need for tty).
+    pub fn _new() -> Self {
+        Self::build(String::new(), true)
     }
 
     pub fn set_totals(&self, files: usize, bytes: u64) {
@@ -136,7 +74,7 @@ impl IngestProgress {
         self.refresh_stats_force();
     }
 
-    pub fn inc_files(&self, n: usize) {
+    pub fn add_files(&self, n: usize) {
         self.inner.files.fetch_add(n, Ordering::Relaxed);
         self.refresh_stats();
     }
@@ -146,38 +84,8 @@ impl IngestProgress {
         self.refresh_stats();
     }
 
-    pub fn inc_blocks(&self, unique: bool) {
-        self.inner.blocks_total.fetch_add(1, Ordering::Relaxed);
-        if unique {
-            self.inner.blocks_unique.fetch_add(1, Ordering::Relaxed);
-        }
-        self.refresh_stats();
-    }
-
-    pub fn set_blocks_unique(&self, n: u64) {
-        self.inner.blocks_unique.store(n, Ordering::Relaxed);
-        self.refresh_stats();
-    }
-
-    pub fn inc_skipped(&self, _reason: SkipReason) {
-        self.inner.skipped.fetch_add(1, Ordering::Relaxed);
-        self.refresh_stats();
-    }
-
-    pub fn skipped(&self) -> usize {
-        self.inner.skipped.load(Ordering::Relaxed)
-    }
-
-    pub fn suspend<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        self.inner.activity.suspend(f)
-    }
-
     pub fn finish_and_clear(&self) {
-        self.inner.activity.finish_and_clear();
-        self.inner.stats.finish_and_clear();
+        tty::clear_headline();
     }
 
     fn refresh_stats(&self) {
@@ -190,76 +98,99 @@ impl IngestProgress {
         }
         *guard = Instant::now();
         drop(guard);
-        self.inner.stats.set_message(self.stats_line());
+        self.draw();
     }
 
+    // Can be called when 'IngestProgress' is surely lock-free
     fn refresh_stats_force(&self) {
-        *self.inner.last_stats.lock().expect("stats lock") = Instant::now();
-        self.inner.stats.set_message(self.stats_line());
+        *self
+            .inner
+            .last_stats
+            .lock()
+            .expect("failed to acquire lock on 'IngestProgress'") = Instant::now();
+        self.draw();
     }
 
-    fn stats_line(&self) -> String {
+    fn draw(&self) {
+        if self.inner.muted {
+            return;
+        }
+        tty::draw_headline(&self.headline());
+    }
+
+    fn headline(&self) -> String {
         let files = self.inner.files.load(Ordering::Relaxed);
         let bytes = self.inner.bytes.load(Ordering::Relaxed);
-        let blocks = self.inner.blocks_total.load(Ordering::Relaxed);
-        let unique = self.inner.blocks_unique.load(Ordering::Relaxed);
-        let skipped = self.inner.skipped.load(Ordering::Relaxed);
-
-        let files_part = if self.inner.has_totals.load(Ordering::Relaxed) == 1 {
-            let total = self.inner.total_files.load(Ordering::Relaxed);
-            format!("{files}/{total}")
+        let (total_files, total_bytes) = if self.inner.has_totals.load(Ordering::Relaxed) == 1 {
+            (
+                Some(self.inner.total_files.load(Ordering::Relaxed)),
+                Some(self.inner.total_bytes.load(Ordering::Relaxed)),
+            )
         } else {
-            format!("{files}")
+            (None, None)
         };
-        let bytes_part = if self.inner.has_totals.load(Ordering::Relaxed) == 1 {
-            let total = self.inner.total_bytes.load(Ordering::Relaxed);
-            format!("{}/{}", format_bytes(bytes), format_bytes(total))
-        } else {
-            format_bytes(bytes)
-        };
-
-        format!(
-            "files {files_part} | bytes {bytes_part} | blocks {blocks} ({unique} unique) | skipped {skipped}"
-        )
+        compose_line(&self.inner.source, files, total_files, bytes, total_bytes)
     }
 }
 
-impl Default for IngestProgress {
-    fn default() -> Self {
-        Self::new()
-    }
+fn compose_line(
+    source: &str,
+    files: usize,
+    total_files: Option<usize>,
+    bytes: u64,
+    total_bytes: Option<u64>,
+) -> String {
+    let files_part = match total_files {
+        Some(t) => format!("{files}/{t}"),
+        None => format!("{files}"),
+    };
+    let bytes_part = match total_bytes {
+        Some(t) => format!("{}/{}", format_bytes(bytes), format_bytes(t)),
+        None => format_bytes(bytes),
+    };
+
+    format!("ingesting {source} ({files_part} files, {bytes_part})")
 }
 
-pub fn format_bytes(n: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = 1024.0 * 1024.0;
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let f = n as f64;
-    if f >= GIB {
-        format!("{:.1} GiB", f / GIB)
-    } else if f >= MIB {
-        format!("{:.1} MiB", f / MIB)
-    } else if f >= KIB {
-        format!("{:.1} KiB", f / KIB)
-    } else {
-        format!("{n} B")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn headline_empty_unknown_totals() {
+        assert_eq!(
+            compose_line("src", 0, None, 0, None),
+            "ingesting src (0 files, 0 B)"
+        );
+    }
+
+    #[test]
+    fn headline_known_totals() {
+        assert_eq!(
+            compose_line("photos", 412, Some(3240), 419430400, Some(3543348019)),
+            "ingesting photos (412/3240 files, 400.0 MiB/3.3 GiB)"
+        );
+    }
+
+    #[test]
+    fn headline_grows_with_counters() {
+        let before = compose_line("src", 3, None, 300, None);
+        let after = compose_line("src", 41, None, 5200, None);
+        assert!(after.len() > before.len());
+        assert!(after.contains("(41 files, "));
+    }
+
+    #[test]
+    fn headline_clear_is_noop_when_nothing_open() {
+        use crate::utils::tty::clear_headline;
+        clear_headline();
+        clear_headline();
     }
 }
 
 use std::borrow::Cow;
 
-fn truncate_path(p: &str) -> Cow<'_, str> {
-    if p.len() <= MAX_PATH_WIDTH {
-        return Cow::Borrowed(p);
-    }
-    let tail_len = MAX_PATH_WIDTH - 3;
-    let start = p.len() - tail_len;
-    let mut i = start;
-    while i < p.len() && !p.is_char_boundary(i) {
-        i += 1;
-    }
-    Cow::Owned(format!("...{}", &p[i.min(p.len())..]))
-}
+use crate::utils::tty;
 
 // ---------- fetch ----------
 
@@ -365,7 +296,7 @@ impl FetchProgress {
         });
         drop(guard);
 
-        if !crate::utils::log::is_unicode()
+        if !crate::utils::tty::is_unicode()
             && let Some(st) = self.inner.state.lock().expect("fetch state lock").as_ref()
         {
             for s in &st.slots {
@@ -411,7 +342,7 @@ impl FetchProgress {
         else {
             return 0;
         };
-        match row.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        match row.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some((v + n).min(size))
         }) {
             Ok(prev) | Err(prev) => (prev + n).min(size),

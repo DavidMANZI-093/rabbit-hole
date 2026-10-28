@@ -7,7 +7,7 @@ use crate::{
     fs::system_time_from_ns,
     info,
     protocol::manifest::{CURRENT, Manifest, common::ManifestError, common::hex_encode, v1::MAGIC},
-    utils::progress::{FetchProgress, format_bytes},
+    utils::{format::format_bytes, progress::FetchProgress},
     warn,
 };
 

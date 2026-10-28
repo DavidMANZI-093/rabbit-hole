@@ -10,7 +10,7 @@ use std::{
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::{utils::ui::prettify, warn};
+use crate::warn;
 
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -49,8 +49,8 @@ pub async fn spawn(port: u16) -> Result<Tunnel, SpawnError> {
     // Unknown versions get full args; can't punish what we can't classify.
     let mut compat = false;
     if let crate::cloudflared::Verdict::TooOld(v) = crate::cloudflared::probe() {
-        crate::warn!(
-            "cloudflared {v} predates minimum {} (tunnel needs --no-prechecks); upgrade cloudflared — running with compat flags",
+        warn!(
+            "cloudflared version is old, need >= {} (have {v})",
             crate::cloudflared::MIN
         );
         compat = true;
@@ -163,13 +163,6 @@ impl Tunnel {
             let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(3));
             if host.ends_with(".trycloudflare.com") {
                 let state = crate::utils::dns::resolve_all_doh(&host).await;
-                let msg = format!(
-                    "propagating... [cf: {}  google: {}  quad9: {}]",
-                    prettify(state.cloudflare.label()),
-                    prettify(state.google.label()),
-                    prettify(state.quad9.label())
-                );
-                on_status(&msg);
 
                 if !state.addrs.is_empty() {
                     builder = builder.resolve_to_addrs(&host, &state.addrs);

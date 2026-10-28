@@ -13,7 +13,7 @@ use crate::{
         FileEntry, Manifest,
         common::{MAX_BLOCK_SIZE, MAX_BLOCKS, MIN_BLOCK_SIZE, validate_path},
     },
-    utils::progress::{IngestProgress, Phase, SkipReason},
+    utils::{format::format_bytes, progress::IngestProgress},
 };
 
 const READ_BUF_SIZE: usize = 128 * 1024;
@@ -49,6 +49,24 @@ pub struct IngestStats {
     pub skipped: usize,
 }
 
+impl IngestStats {
+    pub fn summary(&self) -> String {
+        let dedup_pct = if self.blocks_total > 0 {
+            (self.blocks_total - self.blocks_unique as u64) as f64 / self.blocks_total as f64
+                * 100.0
+        } else {
+            0.0
+        };
+        format!(
+            "found files {}, total size {}\nblocks {} ({} unique, {dedup_pct:.1}% dedup)",
+            self.files,
+            format_bytes(self.bytes),
+            self.blocks_total,
+            self.blocks_unique,
+        )
+    }
+}
+
 pub fn ingest(
     src: &Path,
     block_size: u32,
@@ -76,8 +94,6 @@ pub fn ingest(
         Kind::File => {
             let name = single_file_manifest_path(src)?;
             progress.set_totals(1, meta.size);
-            progress.set_stage(Phase::Hash, &name);
-
             let entry = hash_file(
                 src, &name, &meta, block_size, &mut pool, &mut index, &mut stats, progress,
             )?;
@@ -91,26 +107,19 @@ pub fn ingest(
                 .min_depth(1)
                 .into_iter();
 
-            for (i, dent) in walker.enumerate() {
+            for dent in walker {
                 let dent = match dent {
                     Ok(d) => d,
                     Err(e) => {
                         debug!("walk error: {e}");
                         stats.skipped += 1;
-                        progress.inc_skipped(SkipReason::WalkError);
                         continue;
                     }
                 };
 
-                // set_stage throttles internally but still allocates; batch every 32 to avoid the cost
-                if i % 32 == 0 {
-                    progress.set_stage(Phase::Scan, &dent.path().display().to_string());
-                }
-
                 if dent.file_type().is_symlink() {
                     debug!("skipping symlink {}", dent.path().display());
                     stats.skipped += 1;
-                    progress.inc_skipped(SkipReason::Symlink);
                     continue;
                 }
 
@@ -121,7 +130,6 @@ pub fn ingest(
                     }
                     debug!("skipping non-file {}", dent.path().display());
                     stats.skipped += 1;
-                    progress.inc_skipped(SkipReason::NonFile);
                     continue;
                 }
 
@@ -131,7 +139,6 @@ pub fn ingest(
                     Err(e) => {
                         debug!("stat failed {}: {e}", dent.path().display());
                         stats.skipped += 1;
-                        progress.inc_skipped(SkipReason::StatFailed);
                         continue;
                     }
                 };
@@ -143,7 +150,6 @@ pub fn ingest(
                     Err(e) => {
                         debug!("bad manifest path {}: {e}", abs.display());
                         stats.skipped += 1;
-                        progress.inc_skipped(SkipReason::BadName);
                         continue;
                     }
                 };
@@ -154,8 +160,6 @@ pub fn ingest(
 
             let total_bytes: u64 = paths.iter().map(|(_, s, _)| *s).sum();
             progress.set_totals(paths.len(), total_bytes);
-            progress.set_stage(Phase::Check, "sorting / collision check");
-
             let rels: Vec<&str> = paths.iter().map(|(_, _, r)| r.as_str()).collect();
             if let Some((a, b)) = fs::find_case_collision(&rels) {
                 return Err(IngestError::Collision(a, b));
@@ -163,7 +167,6 @@ pub fn ingest(
 
             for (abs, _, rel) in &paths {
                 let fmeta = crate::fs::metadata(abs).map_err(IngestError::Fs)?;
-                progress.set_stage(Phase::Hash, rel);
                 let entry = hash_file(
                     abs, rel, &fmeta, block_size, &mut pool, &mut index, &mut stats, progress,
                 )?;
@@ -226,6 +229,7 @@ fn to_manifest_path(rel: &Path, abs: &Path) -> Result<String, IngestError> {
     Ok(unix)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hash_file(
     abs: &Path,
     rel: &str,
@@ -252,6 +256,7 @@ fn hash_file(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hash_file_inner(
     abs: &Path,
     rel: &str,
@@ -291,8 +296,7 @@ fn hash_file_inner(
                 in_block += want as u64;
 
                 if in_block == bs {
-                    let unique = push_block(&hasher.finalize(), pool, index, &mut chunks, stats);
-                    progress.inc_blocks(unique);
+                    push_block(&hasher.finalize(), pool, index, &mut chunks, stats);
                     hasher = blake3::Hasher::new();
                     in_block = 0;
                 }
@@ -300,12 +304,11 @@ fn hash_file_inner(
         }
 
         if in_block > 0 {
-            let unique = push_block(&hasher.finalize(), pool, index, &mut chunks, stats);
-            progress.inc_blocks(unique);
+            push_block(&hasher.finalize(), pool, index, &mut chunks, stats);
         }
     }
     stats.files += 1;
-    progress.inc_files(1);
+    progress.add_files(1);
 
     Ok(FileEntry {
         path: rel.to_string(),
@@ -438,7 +441,7 @@ mod tests {
         let file = dir.join("hello.txt");
         std::fs::write(&file, b"hello, rabbit-hole").unwrap();
 
-        let progress = crate::utils::progress::IngestProgress::hidden();
+        let progress = crate::utils::progress::IngestProgress::_new();
         let (manifest, stats) = ingest(
             &file,
             crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE,
@@ -466,7 +469,7 @@ mod tests {
         std::fs::write(photos.join("a.txt"), b"aaa").unwrap();
         std::fs::write(photos.join("b.txt"), b"bbb").unwrap();
 
-        let progress = crate::utils::progress::IngestProgress::hidden();
+        let progress = crate::utils::progress::IngestProgress::_new();
         let (manifest, _) =
             ingest(&photos, DEFAULT_BLOCK_SIZE, &progress).expect("ingest must succeed");
 
@@ -496,7 +499,7 @@ mod tests {
         let file = dir.join("solo.txt");
         std::fs::write(&file, b"solo").unwrap();
 
-        let progress = crate::utils::progress::IngestProgress::hidden();
+        let progress = crate::utils::progress::IngestProgress::_new();
         let (manifest, _) =
             ingest(&file, DEFAULT_BLOCK_SIZE, &progress).expect("ingest must succeed");
 
@@ -529,6 +532,36 @@ mod tests {
     }
 
     #[test]
+    fn summary_locks_three_plain_lines() {
+        let stats = IngestStats {
+            files: 3240,
+            bytes: 3543348019,
+            blocks_total: 6542,
+            blocks_unique: 3272,
+            skipped: 0,
+        };
+        assert_eq!(
+            stats.summary(),
+            "found files 3240, total size 3.3 GiB\nblocks 6542 (3272 unique, 50.0% dedup)"
+        );
+    }
+
+    #[test]
+    fn summary_zero_blocks_shows_zero_dedup() {
+        let stats = IngestStats {
+            files: 0,
+            bytes: 0,
+            blocks_total: 0,
+            blocks_unique: 0,
+            skipped: 5,
+        };
+        assert_eq!(
+            stats.summary(),
+            "found files 0, total size 0 B\nblocks 0 (0 unique, 0.0% dedup)"
+        );
+    }
+
+    #[test]
     fn duplicate_file_content_deduplicates_blocks() {
         let dir = std::env::temp_dir().join(format!("rh-dedup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -538,7 +571,7 @@ mod tests {
         std::fs::write(dir.join("a.bin"), &content).unwrap();
         std::fs::write(dir.join("b.bin"), &content).unwrap();
 
-        let progress = crate::utils::progress::IngestProgress::hidden();
+        let progress = crate::utils::progress::IngestProgress::_new();
         let (manifest, stats) = ingest(
             &dir,
             crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE,
