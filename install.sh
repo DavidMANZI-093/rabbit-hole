@@ -12,7 +12,7 @@ DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
 # ------ helpers ------
 
 log() { printf '  %s\n' "$*"; }
-run() { if [ "$RH_DRY_RUN" = "1" ]; then printf '  + %s\n' "$*"; else "$@"; fi; }
+run() { if [[ "$RH_DRY_RUN" = "1" ]]; then printf '  + %s\n' "$*"; else "$@"; fi; }
 need() { command -v "$1" >/dev/null 2>&1 || {
   echo "error: need '$1' on PATH" >&2
   exit 1
@@ -50,10 +50,10 @@ esac
 
 # ------ version resolution ------
 
-if [ -z "${RH_VERSION:-}" ]; then
+if [[ -z "${RH_VERSION:-}" ]]; then
   log "resolving latest rh release..."
   RH_VERSION="$(curl -fsSL "https://api.github.com/repos/$RH_REPO/releases/latest" | grep -m1 '"tag_name"' | cut -d'"' -f4)"
-  [ -n "$RH_VERSION" ] || {
+  [[ -n "$RH_VERSION" ]] || {
     echo "error: could not resolve latest release (set RH_VERSION=vX.Y.Z)" >&2
     exit 1
   }
@@ -70,10 +70,10 @@ trap 'rm -rf "$TMP"' EXIT
 
 # rh binary (skipped when the installed one already matches the target)
 INSTALLED_RH=""
-if [ -x "$RH_PREFIX/bin/rh" ]; then
+if [[ -x "$RH_PREFIX/bin/rh" ]]; then
   INSTALLED_RH="$("$RH_PREFIX/bin/rh" --version 2>/dev/null | awk '{print $2}')" || INSTALLED_RH=""
 fi
-if [ -n "$INSTALLED_RH" ] && [ "v$INSTALLED_RH" = "$RH_VERSION" ]; then
+if [[ -n "$INSTALLED_RH" ]] && [[ "v$INSTALLED_RH" = "$RH_VERSION" ]]; then
   log "rh $RH_VERSION already installed — skipping"
 else
   log "downloading rh $RH_VERSION..."
@@ -85,10 +85,10 @@ else
 fi
 
 # pinned cloudflared (versions/hashes from the pin file)
-if [ "$WITH_CLOUDFLARED" = "1" ]; then
+if [[ "$WITH_CLOUDFLARED" = "1" ]]; then
   PIN_URL="https://raw.githubusercontent.com/$RH_REPO/$RH_VERSION/third-party/cloudflared.pin"
   log "fetching pin file..."
-  if [ "$RH_DRY_RUN" = "1" ]; then
+  if [[ "$RH_DRY_RUN" = "1" ]]; then
     printf '  + curl -fsSL -o PIN %s\n' "$PIN_URL"
     CF_VERSION="<from pin>"
     CF_SHA="<from pin>"
@@ -100,7 +100,7 @@ if [ "$WITH_CLOUDFLARED" = "1" ]; then
       }
     CF_VERSION="$(grep -m1 '^PINNED=' "$TMP/cloudflared.pin" | cut -d= -f2 | tr -d '[:space:]')"
     CF_SHA="$(grep -m1 "^$CF_ASSET " "$TMP/cloudflared.pin" | awk '{print $2}')"
-    [ -n "$CF_VERSION" ] && [ -n "$CF_SHA" ] ||
+    [[ -n "$CF_VERSION" ]] && [[ -n "$CF_SHA" ]] ||
       {
         echo "error: pin file lacks PINNED= or hash for $CF_ASSET" >&2
         exit 1
@@ -108,10 +108,10 @@ if [ "$WITH_CLOUDFLARED" = "1" ]; then
   fi
   log "downloading cloudflared $CF_VERSION ($CF_ASSET)..."
   INSTALLED_CF=""
-  if [ -x "$DATA_DIR/rh/bin/cloudflared" ]; then
+  if [[ -x "$DATA_DIR/rh/bin/cloudflared" ]]; then
     INSTALLED_CF="$("$DATA_DIR/rh/bin/cloudflared" --version 2>/dev/null | grep -m1 -oE '[0-9]{4}\.[0-9]+\.[0-9]+')" || INSTALLED_CF=""
   fi
-  if [ -n "$INSTALLED_CF" ] && [ "$INSTALLED_CF" = "$CF_VERSION" ]; then
+  if [[ -n "$INSTALLED_CF" ]] && [[ "$INSTALLED_CF" = "$CF_VERSION" ]]; then
     log "cloudflared $CF_VERSION already installed — skipping"
   else
     run curl -fsSL -o "$TMP/cf-asset" "https://github.com/cloudflare/cloudflared/releases/download/$CF_VERSION/$CF_ASSET"
@@ -124,7 +124,7 @@ if [ "$WITH_CLOUDFLARED" = "1" ]; then
       ;;
     *) CF_SRC="$TMP/cf-asset" ;;
     esac
-    if [ "$RH_DRY_RUN" = "1" ]; then
+    if [[ "$RH_DRY_RUN" = "1" ]]; then
       printf '  + verify sha256 %s\n' "$CF_SHA"
     else
       if command -v sha256sum >/dev/null 2>&1; then
