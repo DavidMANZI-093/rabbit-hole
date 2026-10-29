@@ -199,11 +199,14 @@ pub fn ingest(
 }
 
 fn dir_root_name(src: &Path) -> Result<String, IngestError> {
-    let raw = src.file_name().map(|s| s.to_os_string()).or_else(|| {
-        src.canonicalize()
-            .ok()
-            .and_then(|c| c.file_name().map(|s| s.to_os_string()))
-    });
+    let raw = src
+        .file_name()
+        .map(std::ffi::os_str::OsStr::to_os_string)
+        .or_else(|| {
+            src.canonicalize()
+                .ok()
+                .and_then(|c| c.file_name().map(std::ffi::os_str::OsStr::to_os_string))
+        });
     let name = raw.and_then(|s| s.into_string().ok()).ok_or_else(|| {
         IngestError::BadName(format!("cannot derive share name from {}", src.display()))
     })?;

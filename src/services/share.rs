@@ -121,7 +121,7 @@ pub fn build_shared(
 
         let name = src
             .file_name()
-            .and_then(|s| s.to_str())
+            .and_then(std::ffi::os_str::OsStr::to_str)
             .unwrap_or("download")
             .to_string();
         Kind::Single {

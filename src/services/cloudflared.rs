@@ -188,7 +188,7 @@ fn exe_dir_path_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 fn exe_dir() -> Option<std::path::PathBuf> {
     std::env::current_exe()
         .ok()
-        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+        .and_then(|e| e.parent().map(std::path::Path::to_path_buf))
         .and_then(|d| exe_dir_path_in(&d))
 }
 
