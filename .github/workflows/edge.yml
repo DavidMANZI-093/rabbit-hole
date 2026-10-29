@@ -16,8 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - name: install wrangler (pinned major)
-        run: npm install -g wrangler@4 --ignore-scripts
+      - name: install wrangler (pinned version)
+        run: npm install -g wrangler@4.155.0 --ignore-scripts
 
       - name: wrangler deploy
         working-directory: workers
