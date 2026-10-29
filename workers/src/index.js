@@ -136,7 +136,7 @@ export default {
       return handleClaim(req, env, log);
     }
 
-    const codeMatch = pathname.match(/^\/c\/([^/]+)$/);
+    const codeMatch = /^\/c\/([^/]+)$/.exec(pathname);
     if (codeMatch && CODE_RE.test(codeMatch[1])) {
       return handleCode(req, env, codeMatch[1], log);
     }
