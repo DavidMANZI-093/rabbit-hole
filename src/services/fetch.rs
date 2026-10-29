@@ -36,27 +36,76 @@ pub async fn fetch(
     progress: &FetchProgress,
 ) -> Result<FetchStats, String> {
     let base = normalize_base(url)?;
+    let client = build_client(&base, timeout).await?;
+    let (manifest, wire_len) = pull_manifest(&client, &base, bearer.as_deref()).await?;
+
+    prepare_dest(dest, force)?;
+    let files = Arc::new(create_outputs(dest, &manifest).await?);
+    let targets = plan_blocks(&manifest);
+    let n_unique = targets.len();
+    let bytes_total: u64 = manifest.files.iter().map(|f| f.size).sum();
+
+    info!(
+        "manifest size {}, {}:v{} protocol\nfiles {} ({} total, {} blocks)",
+        format_bytes(wire_len),
+        std::str::from_utf8(&MAGIC).unwrap_or("?"),
+        CURRENT,
+        manifest.files.len(),
+        format_bytes(bytes_total),
+        n_unique,
+    );
+
+    progress.begin(manifest.files.len(), n_unique as u64, bytes_total);
+
+    let fetcher = Fetcher::new(
+        client,
+        &base,
+        bearer,
+        files.clone(),
+        concurrency,
+        progress.clone(),
+    );
+    fetcher.run(targets).await?;
+
+    sync_outputs(&files)?;
+    drop(files);
+    restore_metadata(dest, &manifest)?;
+
+    Ok(FetchStats {
+        files: manifest.files.len(),
+        bytes: bytes_total,
+        blocks: n_unique,
+        retries: progress.snapshot().retries,
+    })
+}
+
+async fn build_client(base: &str, timeout: u32) -> Result<Client, String> {
     let mut builder = Client::builder().timeout(Duration::from_millis(timeout as u64));
-    let host = base
-        .strip_prefix("https://")
-        .or_else(|| base.strip_prefix("http://"))
-        .unwrap_or(&base)
-        .split('/')
-        .next()
-        .unwrap_or("");
-    if host.ends_with(".trycloudflare.com") {
+    if let Some(host) = tunnel_host(base) {
         let state = crate::utils::dns::resolve_all_doh(host).await;
         if !state.addrs.is_empty() {
             builder = builder.resolve_to_addrs(host, &state.addrs);
         }
     }
-    let client = builder.build().map_err(|e| format!("http client: {e}"))?;
+    builder.build().map_err(|e| format!("http client: {e}"))
+}
 
-    let (manifest, wire_len) = pull_manifest(&client, &base, bearer.as_deref()).await?;
+fn tunnel_host(base: &str) -> Option<&str> {
+    let rest = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))?;
+    let host = rest.split('/').next().unwrap_or("");
+    host.ends_with(".trycloudflare.com").then_some(host)
+}
 
-    prepare_dest(dest, force)?;
+struct OutputFile {
+    file: std::fs::File,
+    path: String,
+    size: u64,
+}
 
-    let mut out_files: Vec<Arc<std::fs::File>> = Vec::with_capacity(manifest.files.len());
+async fn create_outputs(dest: &Path, manifest: &Manifest) -> Result<Vec<OutputFile>, String> {
+    let mut out = Vec::with_capacity(manifest.files.len());
     for f in &manifest.files {
         let abs = dest.join(&f.path);
         if let Some(parent) = abs.parent() {
@@ -75,152 +124,198 @@ pub async fn fetch(
         let file = file.into_std().await;
 
         utils::fs::preallocate(&file, f.size).map_err(|e| format!("prealloc {}: {e}", f.path))?;
-        out_files.push(Arc::new(file));
+        out.push(OutputFile {
+            file,
+            path: f.path.clone(),
+            size: f.size,
+        });
     }
+    Ok(out)
+}
 
-    let mut block_targets: HashMap<[u8; 32], Vec<(usize, u64)>> = HashMap::new();
+type BlockTargets = HashMap<[u8; 32], Vec<(usize, u64)>>;
+
+fn plan_blocks(manifest: &Manifest) -> BlockTargets {
     let bs = manifest.block_size as u64;
+    let mut targets = BlockTargets::new();
     for (fi, f) in manifest.files.iter().enumerate() {
         for (j, idx) in f.chunks.iter().enumerate() {
             let digest = manifest.pool[*idx as usize];
-            let offset = j as u64 * bs;
-            block_targets.entry(digest).or_default().push((fi, offset));
+            targets.entry(digest).or_default().push((fi, j as u64 * bs));
+        }
+    }
+    targets
+}
+
+#[derive(Clone)]
+struct Fetcher {
+    client: Client,
+    base: Arc<str>,
+    token: Option<Arc<str>>,
+    files: Arc<Vec<OutputFile>>,
+    sem: Arc<tokio::sync::Semaphore>,
+    progress: FetchProgress,
+}
+
+impl Fetcher {
+    fn new(
+        client: Client,
+        base: &str,
+        token: Option<String>,
+        files: Arc<Vec<OutputFile>>,
+        concurrency: u8,
+        progress: FetchProgress,
+    ) -> Self {
+        Self {
+            client,
+            base: Arc::from(base),
+            token: token.map(Arc::from),
+            files,
+            sem: Arc::new(tokio::sync::Semaphore::new(concurrency.max(1) as usize)),
+            progress,
         }
     }
 
-    let n_unique = block_targets.len();
-    let bytes_total: u64 = manifest.files.iter().map(|f| f.size).sum();
-
-    info!(
-        "manifest size {}, {}:v{} protocol\nfiles {} ({} total, {} blocks)",
-        format_bytes(wire_len),
-        std::str::from_utf8(&MAGIC).unwrap_or("?"),
-        CURRENT,
-        manifest.files.len(),
-        format_bytes(bytes_total),
-        n_unique,
-    );
-
-    progress.begin(manifest.files.len(), n_unique as u64, bytes_total);
-
-    let out_files = Arc::new(out_files);
-    let base = Arc::new(base);
-    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1) as usize));
-    let mut tasks = Vec::with_capacity(n_unique);
-    let file_sizes: Arc<Vec<u64>> = Arc::new(manifest.files.iter().map(|f| f.size).collect());
-
-    for (digest, locs) in block_targets {
-        let files = out_files.clone();
-        let sizes = file_sizes.clone();
-        let token = bearer.clone();
-        let client = client.clone();
-        let base = base.clone();
-        let sem = sem.clone();
-        let prog = progress.clone();
-        tasks.push(tokio::spawn(async move {
-            let _permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
-            let hex = hex_encode(&digest);
-
-            let mut last_err = String::new();
-            for attempt in 1..=(1 + RETRIES) {
-                match fetch_block(&client, &base, token.as_deref(), &hex).await {
-                    Ok(data) => {
-                        if blake3::hash(&data).as_bytes() != &digest {
-                            last_err = format!("block {hex}: hash mismatch");
-                        } else {
-                            for (fi, off) in &locs {
-                                let add = (data.len() as u64).min(sizes[*fi].saturating_sub(*off));
-                                if let Err(e) = crate::utils::fs::write_at(
-                                    &files[*fi],
-                                    &data[..add as usize],
-                                    *off,
-                                ) {
-                                    prog.inc_failed();
-                                    return Err(format!("write block {hex} at {off}: {e}"));
-                                }
-                            }
-                            prog.add_bytes(data.len() as u64);
-                            prog.inc_blocks();
-                            return Ok::<(), String>(());
-                        }
-                    }
-                    Err(BlockError::Fatal(e)) => {
-                        last_err = e;
-                        break;
-                    }
-                    Err(BlockError::Retryable(e)) => last_err = e,
-                }
-                if attempt <= RETRIES {
-                    prog.inc_retries();
-                    tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
-                }
-            }
-            prog.inc_failed();
-            Err(last_err)
-        }));
+    async fn run(self, targets: BlockTargets) -> Result<(), String> {
+        let mut tasks = Vec::with_capacity(targets.len());
+        for (digest, locs) in targets {
+            let fetcher = self.clone();
+            tasks.push(tokio::spawn(async move {
+                let _permit = fetcher
+                    .sem
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                fetcher.download(digest, &locs).await
+            }));
+        }
+        join_all(tasks, &self.progress).await
     }
 
+    async fn download(&self, digest: [u8; 32], locs: &[(usize, u64)]) -> Result<(), String> {
+        let result = self.try_download(digest, locs).await;
+        if result.is_err() {
+            self.progress.inc_failed();
+        }
+        result
+    }
+
+    async fn try_download(&self, digest: [u8; 32], locs: &[(usize, u64)]) -> Result<(), String> {
+        let hex = hex_encode(&digest);
+        let mut last_err = String::new();
+
+        for attempt in 1..=(1 + RETRIES) {
+            match fetch_block(
+                &self.client,
+                &self.base,
+                self.token.as_deref(),
+                &hex,
+                &digest,
+            )
+            .await
+            {
+                Ok(data) => {
+                    self.write_block(&data, locs, &hex)?;
+                    self.progress.add_bytes(data.len() as u64);
+                    self.progress.inc_blocks();
+                    return Ok(());
+                }
+                Err(BlockError::Fatal(e)) => {
+                    last_err = e;
+                    break;
+                }
+                Err(BlockError::Retryable(e)) => last_err = e,
+            }
+            if attempt <= RETRIES {
+                self.progress.inc_retries();
+                tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+            }
+        }
+
+        Err(last_err)
+    }
+
+    fn write_block(&self, data: &[u8], locs: &[(usize, u64)], hex: &str) -> Result<(), String> {
+        for &(fi, off) in locs {
+            let target = &self.files[fi];
+            let len = (data.len() as u64).min(target.size.saturating_sub(off));
+            if let Err(e) = crate::utils::fs::write_at(&target.file, &data[..len as usize], off) {
+                return Err(format!("write block {hex} at {off}: {e}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+const MAX_REPORTED_ERRORS: usize = 5;
+
+async fn join_all(
+    tasks: Vec<tokio::task::JoinHandle<Result<(), String>>>,
+    progress: &FetchProgress,
+) -> Result<(), String> {
     let mut failed = 0usize;
     let mut err_lines: Vec<String> = Vec::new();
-    for t in tasks {
-        match t.await {
+
+    for task in tasks {
+        match task.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 failed += 1;
-                if err_lines.len() < 5 {
-                    err_lines.push(e);
-                }
+                remember_error(&mut err_lines, e);
             }
             Err(e) => {
                 failed += 1;
                 progress.inc_failed();
-                if err_lines.len() < 5 {
-                    err_lines.push(format!("task panicked: {e}"));
-                }
+                remember_error(&mut err_lines, format!("task panicked: {e}"));
             }
         }
     }
+
     for e in err_lines {
         error!("{e}");
     }
 
-    if failed > 0 {
-        return Err(format!("{failed} block(s) failed — dest is incomplete"));
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(format!("{failed} block(s) failed — dest is incomplete"))
     }
+}
 
-    for (file, f) in out_files.iter().zip(manifest.files.iter()) {
-        crate::utils::fs::sync(file).map_err(|e| format!("fsync {}: {e}", f.path))?;
+fn remember_error(lines: &mut Vec<String>, e: String) {
+    if lines.len() < MAX_REPORTED_ERRORS {
+        lines.push(e);
     }
-    drop(out_files);
+}
 
+fn sync_outputs(files: &[OutputFile]) -> Result<(), String> {
+    for f in files {
+        utils::fs::sync(&f.file).map_err(|e| format!("fsync {}: {e}", f.path))?;
+    }
+    Ok(())
+}
+
+fn restore_metadata(dest: &Path, manifest: &Manifest) -> Result<(), String> {
     for f in &manifest.files {
         let abs = dest.join(&f.path);
-        let meta = crate::utils::fs::metadata(&abs).map_err(|e| e.to_string())?;
+        let meta = utils::fs::metadata(&abs).map_err(|e| e.to_string())?;
 
         if let Some(mode) = f.mode
-            && let Err(e) = crate::utils::fs::apply_metadata(&abs, Some(mode), None)
+            && let Err(e) = utils::fs::apply_metadata(&abs, Some(mode), None)
         {
             warn!("chmod {}: {e}", abs.display());
         }
 
         if let Some(ns) = f.mtime_ns
             && let Some(_st) = system_time_from_ns(ns)
+            && meta.mtime_ns != Some(ns)
+            && let Err(e) = utils::fs::apply_metadata(&abs, None, Some(ns))
         {
-            let cur_mtime = meta.mtime_ns;
-            if cur_mtime != Some(ns)
-                && let Err(e) = crate::utils::fs::apply_metadata(&abs, None, Some(ns))
-            {
-                warn!("utime {}: {e}", abs.display());
-            }
+            warn!("utime {}: {e}", abs.display());
         }
     }
-
-    Ok(FetchStats {
-        files: manifest.files.len(),
-        bytes: bytes_total,
-        blocks: n_unique,
-        retries: progress.snapshot().retries,
-    })
+    Ok(())
 }
 
 pub fn normalize_base(url: &str) -> Result<String, String> {
@@ -326,6 +421,7 @@ async fn fetch_block(
     base: &str,
     token: Option<&str>,
     hex: &str,
+    digest: &[u8; 32],
 ) -> Result<Vec<u8>, BlockError> {
     let mut req = client.get(format!("{base}/__rh__/block/{hex}"));
     if let Some(t) = token {
@@ -337,11 +433,17 @@ async fn fetch_block(
         .await
         .map_err(|e| BlockError::Retryable(format!("block {hex}: {e}")))?;
     match res.status() {
-        s if s.is_success() => res
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| BlockError::Retryable(format!("block {hex}: read body: {e}"))),
+        s if s.is_success() => {
+            let data = res
+                .bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|e| BlockError::Retryable(format!("block {hex}: read body: {e}")))?;
+            if blake3::hash(&data).as_bytes() != digest {
+                return Err(BlockError::Retryable(format!("block {hex}: hash mismatch")));
+            }
+            Ok(data)
+        }
         s if s.as_u16() == 401 => Err(BlockError::Fatal(format!(
             "block {hex}: 401 — wrong --token"
         ))),
@@ -355,6 +457,7 @@ async fn fetch_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::manifest::FileEntry;
 
     // --- decode_error ---
 
@@ -465,6 +568,86 @@ mod tests {
     #[test]
     fn rejects_empty_string() {
         assert!(normalize_base("").is_err());
+    }
+
+    // --- tunnel_host ---
+
+    #[test]
+    fn tunnel_host_matches_only_trycloudflare() {
+        assert_eq!(
+            tunnel_host("https://abc.trycloudflare.com"),
+            Some("abc.trycloudflare.com")
+        );
+        assert_eq!(tunnel_host("http://127.0.0.1:8080"), None);
+        assert_eq!(tunnel_host("https://example.com/x"), None);
+    }
+
+    // --- block planning / outputs ---
+
+    #[test]
+    fn plan_blocks_deduplicates_repeated_digests() {
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+        let manifest = Manifest {
+            block_size: 4096,
+            pool: vec![first, second],
+            root: None,
+            files: vec![
+                FileEntry {
+                    path: "a".into(),
+                    size: 8192,
+                    mode: None,
+                    mtime_ns: None,
+                    chunks: vec![0, 1],
+                },
+                FileEntry {
+                    path: "b".into(),
+                    size: 4096,
+                    mode: None,
+                    mtime_ns: None,
+                    chunks: vec![0],
+                },
+            ],
+        };
+
+        let targets = plan_blocks(&manifest);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[&first], vec![(0, 0), (1, 0)]);
+        assert_eq!(targets[&second], vec![(0, 4096)]);
+    }
+
+    #[tokio::test]
+    async fn create_outputs_makes_nested_dirs_and_preallocates() {
+        let dir = std::env::temp_dir().join(format!("rh-create-outputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manifest = Manifest {
+            block_size: 4096,
+            pool: vec![],
+            root: None,
+            files: vec![FileEntry {
+                path: "nested/a.txt".into(),
+                size: 12,
+                mode: None,
+                mtime_ns: None,
+                chunks: vec![],
+            }],
+        };
+
+        let files = create_outputs(&dir, &manifest)
+            .await
+            .expect("create outputs");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "nested/a.txt");
+        assert_eq!(files[0].size, 12);
+        assert_eq!(
+            std::fs::metadata(dir.join("nested/a.txt"))
+                .expect("metadata")
+                .len(),
+            12
+        );
+
+        drop(files);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // --- prepare_dest ---
