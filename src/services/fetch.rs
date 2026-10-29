@@ -4,8 +4,12 @@ use reqwest::Client;
 
 use crate::{
     error, info,
-    protocol::manifest::{CURRENT, Manifest, common::ManifestError, common::hex_encode, v1::MAGIC},
-    utils::{format::format_bytes, fs::system_time_from_ns, progress::FetchProgress},
+    protocol::manifest::{
+        CURRENT, Manifest,
+        common::{ManifestError, hex_encode},
+        v1::MAGIC,
+    },
+    utils::{self, format::format_bytes, fs::system_time_from_ns, progress::FetchProgress},
     warn,
 };
 
@@ -56,18 +60,21 @@ pub async fn fetch(
     for f in &manifest.files {
         let abs = dest.join(&f.path);
         if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent)
+            tokio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
 
-        let file = std::fs::OpenOptions::new()
+        let file = tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&abs)
+            .await
             .map_err(|e| format!("create {}: {e}", abs.display()))?;
-        crate::utils::fs::preallocate(&file, f.size)
-            .map_err(|e| format!("prealloc {}: {e}", f.path))?;
+        let file = file.into_std().await;
+
+        utils::fs::preallocate(&file, f.size).map_err(|e| format!("prealloc {}: {e}", f.path))?;
         out_files.push(Arc::new(file));
     }
 

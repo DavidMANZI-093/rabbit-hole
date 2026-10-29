@@ -114,7 +114,8 @@ impl EdgeClient {
         ttl: u16,
         memory: &Path,
     ) -> Result<String, EdgeError> {
-        let want = std::fs::read_to_string(memory)
+        let want = tokio::fs::read_to_string(memory)
+            .await
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| validate_code(s).is_ok());
@@ -125,9 +126,9 @@ impl EdgeClient {
             match self.claim(url, candidate.as_deref(), ttl).await {
                 Ok(code) => {
                     if let Some(parent) = memory.parent() {
-                        std::fs::create_dir_all(parent).ok();
+                        tokio::fs::create_dir_all(parent).await.ok();
                     }
-                    std::fs::write(memory, &code).ok();
+                    tokio::fs::write(memory, &code).await.ok();
                     return Ok(code);
                 }
                 Err(EdgeError::Taken) => {
