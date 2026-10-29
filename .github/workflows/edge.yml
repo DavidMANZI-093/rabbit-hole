@@ -14,10 +14,10 @@ jobs:
     name: deploy edge
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: install wrangler (pinned major)
-        run: npm install -g wrangler@4
+        run: npm install -g wrangler@4 --ignore-scripts
 
       - name: wrangler deploy
         working-directory: workers
