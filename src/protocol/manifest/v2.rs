@@ -61,122 +61,112 @@ pub fn encode(m: &Manifest) -> Vec<u8> {
     out
 }
 
-pub fn decode(input: &[u8]) -> Result<Manifest, ManifestError> {
-    if input.len() > MAX_MANIFEST_BYTES as usize {
-        return Err(ManifestError::TooLarge(MAX_MANIFEST_BYTES));
-    }
+// Cap preallocation so a claimed count cannot force a huge allocation before
+// the bytes backing it have actually arrived.
+const PREALLOC_CAP: u64 = 1 << 20;
 
-    let mut r = Reader::new(input);
-    let magic: [u8; 4] = r.take(4).and_then(|s| {
-        s.try_into().map_err(|_| ManifestError::Truncated {
-            at: r.position(),
-            need: 4,
+struct Header {
+    flags: u16,
+    block_size: u32,
+    root: Option<String>,
+    file_count: u64,
+    block_count: u64,
+}
+
+impl Header {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, ManifestError> {
+        let magic = r.array::<4>()?;
+        if magic != MAGIC {
+            return Err(ManifestError::BadMagic);
+        }
+
+        let version = r.u16_le()?;
+        if version != VERSION {
+            return Err(ManifestError::UnsupportedVersion(version));
+        }
+
+        let flags = r.u16_le()?;
+        if flags & !KNOWN_FLAGS != 0 {
+            return Err(ManifestError::UnknownFlags(flags));
+        }
+
+        let block_size = r.u32_le()?;
+        if !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block_size) {
+            return Err(ManifestError::BadBlockSize(block_size));
+        }
+
+        Ok(Self {
+            flags,
+            block_size,
+            root: decode_root(r)?,
+            file_count: r.uleb_limited(u64::from(MAX_FILES))?,
+            block_count: r.uleb_limited(u64::from(MAX_BLOCKS))?,
         })
-    })?;
-    if magic != MAGIC {
-        return Err(ManifestError::BadMagic);
+    }
+}
+
+fn decode_root(r: &mut Reader<'_>) -> Result<Option<String>, ManifestError> {
+    let len = r.uleb_limited(MAX_PATH_LEN as u64)?;
+    if len == 0 {
+        return Ok(None);
     }
 
-    let version = r.u16_le()?;
-    if version != VERSION {
-        return Err(ManifestError::UnsupportedVersion(version));
+    let root = r.str(len as usize)?;
+    validate_path(root)?;
+    if root.contains('/') {
+        return Err(ManifestError::BadPath(
+            root.to_string(),
+            "root must be a single path component",
+        ));
     }
+    Ok(Some(root.to_string()))
+}
 
-    let flags = r.u16_le()?;
-    if flags & !KNOWN_FLAGS != 0 {
-        return Err(ManifestError::UnknownFlags(flags));
+fn decode_pool(r: &mut Reader<'_>, count: u64) -> Result<Vec<[u8; 32]>, ManifestError> {
+    let mut pool = Vec::with_capacity(capacity(count));
+    for _ in 0..count {
+        pool.push(r.array::<32>()?);
     }
+    Ok(pool)
+}
 
-    let block_size = r.u32_le()?;
-    if !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block_size) {
-        return Err(ManifestError::BadBlockSize(block_size));
-    }
+fn decode_files<'a>(r: &mut Reader<'a>, header: &Header) -> Result<Vec<FileEntry>, ManifestError> {
+    let mut files = Vec::with_capacity(capacity(header.file_count));
+    let mut seen: HashSet<&'a str> = HashSet::with_capacity(files.capacity());
+    let root_prefix = header.root.as_ref().map(|root| format!("{root}/"));
 
-    let root_len = r.uleb()?;
-    if root_len > MAX_PATH_LEN as u64 {
-        return Err(ManifestError::OverLimit(root_len, MAX_PATH_LEN as u64));
-    }
-    let root = if root_len == 0 {
-        None
-    } else {
-        let s =
-            std::str::from_utf8(r.take(root_len as usize)?).map_err(|_| ManifestError::BadUtf8)?;
-        validate_path(s)?;
-        if s.contains('/') {
+    for _ in 0..header.file_count {
+        let len = r.uleb_limited(MAX_PATH_LEN as u64)?;
+        if len == 0 {
+            return Err(ManifestError::OverLimit(0, MAX_PATH_LEN as u64));
+        }
+
+        let path = r.str(len as usize)?;
+        validate_path(path)?;
+        if let Some(prefix) = &root_prefix
+            && !path.starts_with(prefix.as_str())
+        {
             return Err(ManifestError::BadPath(
-                s.to_string(),
-                "root must be a single path component",
+                path.to_string(),
+                "outside manifest root",
             ));
         }
-        Some(s.to_string())
-    };
-
-    let file_count = r.uleb()?;
-    if file_count > MAX_FILES as u64 {
-        return Err(ManifestError::OverLimit(file_count, MAX_FILES as u64));
-    }
-
-    let block_count = r.uleb()?;
-    if block_count > MAX_BLOCKS as u64 {
-        return Err(ManifestError::OverLimit(block_count, MAX_BLOCKS as u64));
-    }
-
-    let mut pool = Vec::with_capacity(block_count.min(1 << 20) as usize);
-    for _ in 0..block_count {
-        let mut h = [0u8; 32];
-        h.copy_from_slice(r.take(32)?);
-        pool.push(h);
-    }
-
-    let mut files = Vec::with_capacity(file_count.min(1 << 20) as usize);
-    let mut seen = HashSet::with_capacity(files.capacity());
-
-    for _ in 0..file_count {
-        let plen = r.uleb()?;
-        if plen == 0 || plen > MAX_PATH_LEN as u64 {
-            return Err(ManifestError::OverLimit(plen, MAX_PATH_LEN as u64));
-        }
-
-        let path =
-            std::str::from_utf8(r.take(plen as usize)?).map_err(|_| ManifestError::BadUtf8)?;
-        validate_path(path)?;
-        if !seen.insert(path.to_string()) {
+        if !seen.insert(path) {
             return Err(ManifestError::DuplicatePath(path.to_string()));
         }
 
         let size = r.uleb()?;
-
-        let mode = if flags & FLAG_UNIX_MODE != 0 {
+        let mode = if header.flags & FLAG_UNIX_MODE != 0 {
             Some(r.u32_le()?)
         } else {
             None
         };
-
-        let mtime_ns = if flags & FLAG_MTIME != 0 {
+        let mtime_ns = if header.flags & FLAG_MTIME != 0 {
             Some(r.i64_le()?)
         } else {
             None
         };
-
-        let chunk_count = r.uleb()?;
-        if chunk_count != expected_chunks(size, block_size) {
-            return Err(ManifestError::ChunkMismatch {
-                got: chunk_count,
-                size,
-                bs: block_size,
-            });
-        }
-        if chunk_count > MAX_BLOCKS as u64 {
-            return Err(ManifestError::OverLimit(chunk_count, MAX_BLOCKS as u64));
-        }
-        let mut chunks = Vec::with_capacity(chunk_count.min(1 << 20) as usize);
-        for _ in 0..chunk_count {
-            let idx = r.uleb()?;
-            if idx >= block_count {
-                return Err(ManifestError::BlockIndexOob(idx, pool.len()));
-            }
-            chunks.push(idx as u32);
-        }
+        let chunks = decode_chunks(r, size, header.block_size, header.block_count)?;
 
         files.push(FileEntry {
             path: path.to_string(),
@@ -187,29 +177,62 @@ pub fn decode(input: &[u8]) -> Result<Manifest, ManifestError> {
         });
     }
 
+    Ok(files)
+}
+
+fn decode_chunks(
+    r: &mut Reader<'_>,
+    size: u64,
+    block_size: u32,
+    block_count: u64,
+) -> Result<Vec<u32>, ManifestError> {
+    let count = r.uleb()?;
+    if count != expected_chunks(size, block_size) {
+        return Err(ManifestError::ChunkMismatch {
+            got: count,
+            size,
+            bs: block_size,
+        });
+    }
+    if count > u64::from(MAX_BLOCKS) {
+        return Err(ManifestError::OverLimit(count, u64::from(MAX_BLOCKS)));
+    }
+
+    let mut chunks = Vec::with_capacity(capacity(count));
+    for _ in 0..count {
+        let idx = r.uleb()?;
+        if idx >= block_count {
+            return Err(ManifestError::BlockIndexOob(idx, block_count as usize));
+        }
+        chunks.push(idx as u32);
+    }
+    Ok(chunks)
+}
+
+fn capacity(n: u64) -> usize {
+    n.min(PREALLOC_CAP) as usize
+}
+
+pub fn decode(input: &[u8]) -> Result<Manifest, ManifestError> {
+    if input.len() > MAX_MANIFEST_BYTES as usize {
+        return Err(ManifestError::TooLarge(MAX_MANIFEST_BYTES));
+    }
+
+    let mut r = Reader::new(input);
+    let header = Header::decode(&mut r)?;
+    let pool = decode_pool(&mut r, header.block_count)?;
+    let files = decode_files(&mut r, &header)?;
+
     if r.position() != input.len() {
         return Err(ManifestError::Trailing(input.len() - r.position()));
     }
 
-    let manifest = Manifest {
-        block_size,
+    Ok(Manifest {
+        block_size: header.block_size,
         pool,
         files,
-        root,
-    };
-    // Root/file-prefix consistency, same rules as Manifest::validate.
-    if let Some(rr) = &manifest.root {
-        let prefix = format!("{rr}/");
-        for f in &manifest.files {
-            if !f.path.starts_with(prefix.as_str()) {
-                return Err(ManifestError::BadPath(
-                    f.path.clone(),
-                    "outside manifest root",
-                ));
-            }
-        }
-    }
-    Ok(manifest)
+        root: header.root,
+    })
 }
 
 #[cfg(test)]
@@ -285,8 +308,7 @@ mod tests {
     #[test]
     fn file_outside_root_rejected_on_decode() {
         // Hand-built v2: root "photos", one empty file "other/a.txt".
-        let mut bytes = vec![b'R', b'H', b'B', b'1', 2, 0, 0, 0];
-        bytes.extend_from_slice(&(DEFAULT_BLOCK_SIZE).to_le_bytes());
+        let mut bytes = bare_v2();
         bytes.push(6);
         bytes.extend_from_slice(b"photos");
         bytes.push(1); // file count
@@ -297,5 +319,74 @@ mod tests {
         bytes.push(0); // chunks
         let err = decode(&bytes).unwrap_err();
         assert!(matches!(err, ManifestError::BadPath(_, _)));
+    }
+
+    fn bare_v2() -> Vec<u8> {
+        let mut bytes = vec![b'R', b'H', b'B', b'1', 2, 0, 0, 0];
+        bytes.extend_from_slice(&DEFAULT_BLOCK_SIZE.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn duplicate_path_rejected_on_decode() {
+        let mut bytes = bare_v2();
+        bytes.push(0); // no root
+        bytes.push(2); // file count
+        bytes.push(0); // pool count
+        for _ in 0..2 {
+            bytes.push(1);
+            bytes.push(b'a');
+            bytes.push(0); // size
+            bytes.push(0); // chunks
+        }
+        let err = decode(&bytes).unwrap_err();
+        assert!(matches!(err, ManifestError::DuplicatePath(ref p) if p == "a"));
+    }
+
+    #[test]
+    fn empty_file_path_rejected_on_decode() {
+        let mut bytes = bare_v2();
+        bytes.push(0); // no root
+        bytes.push(1); // file count
+        bytes.push(0); // pool count
+        bytes.push(0); // path length
+        let err = decode(&bytes).unwrap_err();
+        assert!(matches!(err, ManifestError::OverLimit(0, _)));
+    }
+
+    #[test]
+    fn chunk_count_mismatch_rejected_on_decode() {
+        let mut bytes = bare_v2();
+        bytes.push(0); // no root
+        bytes.push(1); // file count
+        bytes.push(0); // pool count
+        bytes.push(1); // path length
+        bytes.push(b'a');
+        bytes.push(1); // size: expects one chunk
+        bytes.push(0); // chunks: claims none
+        let err = decode(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestError::ChunkMismatch {
+                got: 0,
+                size: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn block_index_out_of_bounds_rejected_on_decode() {
+        let mut bytes = bare_v2();
+        bytes.push(0); // no root
+        bytes.push(1); // file count
+        bytes.push(0); // pool count
+        bytes.push(1); // path length
+        bytes.push(b'a');
+        bytes.push(1); // size
+        bytes.push(1); // chunk count
+        bytes.push(0); // chunk index, but the pool is empty
+        let err = decode(&bytes).unwrap_err();
+        assert!(matches!(err, ManifestError::BlockIndexOob(0, 0)));
     }
 }

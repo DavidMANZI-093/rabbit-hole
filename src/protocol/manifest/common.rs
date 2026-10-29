@@ -112,26 +112,27 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
 
+    // Fixed-size array; `take` already proves the length, so this cannot fail.
+    pub fn array<const N: usize>(&mut self) -> Result<[u8; N], ManifestError> {
+        let mut out = [0u8; N];
+        out.copy_from_slice(self.take(N)?);
+        Ok(out)
+    }
+
+    pub fn str(&mut self, n: usize) -> Result<&'a str, ManifestError> {
+        std::str::from_utf8(self.take(n)?).map_err(|_| ManifestError::BadUtf8)
+    }
+
     pub fn position(&self) -> usize {
         self.pos
     }
 
     pub fn u16_le(&mut self) -> Result<u16, ManifestError> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().map_err(
-            |_| ManifestError::Truncated {
-                at: self.pos,
-                need: 2,
-            },
-        )?))
+        Ok(u16::from_le_bytes(self.array()?))
     }
 
     pub fn u32_le(&mut self) -> Result<u32, ManifestError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().map_err(
-            |_| ManifestError::Truncated {
-                at: self.pos,
-                need: 4,
-            },
-        )?))
+        Ok(u32::from_le_bytes(self.array()?))
     }
 
     pub fn uleb(&mut self) -> Result<u64, ManifestError> {
@@ -165,13 +166,16 @@ impl<'a> Reader<'a> {
         }
     }
 
+    pub fn uleb_limited(&mut self, max: u64) -> Result<u64, ManifestError> {
+        let n = self.uleb()?;
+        if n > max {
+            return Err(ManifestError::OverLimit(n, max));
+        }
+        Ok(n)
+    }
+
     pub fn i64_le(&mut self) -> Result<i64, ManifestError> {
-        Ok(i64::from_le_bytes(self.take(8)?.try_into().map_err(
-            |_| ManifestError::Truncated {
-                at: self.pos,
-                need: 8,
-            },
-        )?))
+        Ok(i64::from_le_bytes(self.array()?))
     }
 }
 
@@ -387,5 +391,40 @@ mod tests {
         // 0x00 encoded as two bytes (0x80, 0x00) is non-canonical
         let non_canonical = vec![0x80u8, 0x00];
         assert!(Reader::new(&non_canonical).uleb().is_err());
+    }
+
+    #[test]
+    fn uleb_limited_accepts_the_limit() {
+        let buf = [42u8];
+        assert_eq!(Reader::new(&buf).uleb_limited(42).unwrap(), 42);
+    }
+
+    #[test]
+    fn uleb_limited_rejects_over_the_limit() {
+        let buf = [43u8];
+        assert!(matches!(
+            Reader::new(&buf).uleb_limited(42),
+            Err(ManifestError::OverLimit(43, 42))
+        ));
+    }
+
+    #[test]
+    fn reader_str_rejects_invalid_utf8() {
+        let buf = [0xffu8];
+        assert!(matches!(
+            Reader::new(&buf).str(1),
+            Err(ManifestError::BadUtf8)
+        ));
+    }
+
+    #[test]
+    fn reader_array_reports_truncation_without_advancing() {
+        let buf = [1u8, 2, 3];
+        let mut r = Reader::new(&buf);
+        assert!(matches!(
+            r.array::<4>(),
+            Err(ManifestError::Truncated { at: 0, need: 4 })
+        ));
+        assert_eq!(r.position(), 0);
     }
 }
