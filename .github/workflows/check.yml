@@ -21,6 +21,7 @@ jobs:
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
       - name: cache cargo registry + build artifacts
