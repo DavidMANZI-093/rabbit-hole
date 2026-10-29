@@ -57,7 +57,7 @@ async fn spawn(port: u16) -> Result<Tunnel, SpawnError> {
 
     let origin = format!("http://127.0.0.1:{port}");
 
-    let mut child = crate::cloudflared::command(&origin)
+    let mut child = super::cloudflared::command(&origin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

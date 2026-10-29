@@ -107,8 +107,9 @@ pub fn build_shared(
             return Err("single-file share expects exactly one manifest entry".into());
         }
 
-        let live = crate::fs::metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
-        if live.kind != crate::fs::Kind::File {
+        let live =
+            crate::utils::fs::metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
+        if live.kind != crate::utils::fs::Kind::File {
             return Err(format!("refusing non-file {}", src.display()));
         }
         if live.size != entry.size {
@@ -170,7 +171,7 @@ fn read_verified_block(want: &[u8; 32], cands: &[Locator]) -> Result<Vec<u8>, St
         let mut buf = vec![0u8; loc.len as usize];
         let mut off = 0;
         while off < buf.len() {
-            match crate::fs::read_at(&f, &mut buf[off..], loc.offset + off as u64) {
+            match crate::utils::fs::read_at(&f, &mut buf[off..], loc.offset + off as u64) {
                 Ok(0) => break,
                 Ok(n) => off += n,
                 Err(_) => break,

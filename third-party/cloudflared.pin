@@ -2,7 +2,7 @@
 #
 # Single source of truth, consumed by:
 #   - install.sh / install.ps1  (CLOUDFLARED_VERSION + per-asset sha256)
-#   - src/cloudflared.rs tests  (MIN line must equal `MIN` const)
+#   - src/services/cloudflared.rs tests  (MIN line must equal `MIN` const)
 #
 # MIN:    oldest supported release. `--no-prechecks` flag feature is TUN-10387,
 #         first shipped in 2026.5.0.

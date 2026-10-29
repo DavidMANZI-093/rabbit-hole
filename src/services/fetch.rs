@@ -3,11 +3,9 @@ use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use reqwest::Client;
 
 use crate::{
-    error,
-    fs::system_time_from_ns,
-    info,
+    error, info,
     protocol::manifest::{CURRENT, Manifest, common::ManifestError, common::hex_encode, v1::MAGIC},
-    utils::{format::format_bytes, progress::FetchProgress},
+    utils::{format::format_bytes, fs::system_time_from_ns, progress::FetchProgress},
     warn,
 };
 
@@ -68,7 +66,8 @@ pub async fn fetch(
             .truncate(true)
             .open(&abs)
             .map_err(|e| format!("create {}: {e}", abs.display()))?;
-        crate::fs::preallocate(&file, f.size).map_err(|e| format!("prealloc {}: {e}", f.path))?;
+        crate::utils::fs::preallocate(&file, f.size)
+            .map_err(|e| format!("prealloc {}: {e}", f.path))?;
         out_files.push(Arc::new(file));
     }
 
@@ -124,9 +123,11 @@ pub async fn fetch(
                         } else {
                             for (fi, off) in &locs {
                                 let add = (data.len() as u64).min(sizes[*fi].saturating_sub(*off));
-                                if let Err(e) =
-                                    crate::fs::write_at(&files[*fi], &data[..add as usize], *off)
-                                {
+                                if let Err(e) = crate::utils::fs::write_at(
+                                    &files[*fi],
+                                    &data[..add as usize],
+                                    *off,
+                                ) {
                                     prog.inc_failed();
                                     return Err(format!("write block {hex} at {off}: {e}"));
                                 }
@@ -181,16 +182,16 @@ pub async fn fetch(
     }
 
     for (file, f) in out_files.iter().zip(manifest.files.iter()) {
-        crate::fs::sync(file).map_err(|e| format!("fsync {}: {e}", f.path))?;
+        crate::utils::fs::sync(file).map_err(|e| format!("fsync {}: {e}", f.path))?;
     }
     drop(out_files);
 
     for f in &manifest.files {
         let abs = dest.join(&f.path);
-        let meta = crate::fs::metadata(&abs).map_err(|e| e.to_string())?;
+        let meta = crate::utils::fs::metadata(&abs).map_err(|e| e.to_string())?;
 
         if let Some(mode) = f.mode
-            && let Err(e) = crate::fs::apply_metadata(&abs, Some(mode), None)
+            && let Err(e) = crate::utils::fs::apply_metadata(&abs, Some(mode), None)
         {
             warn!("chmod {}: {e}", abs.display());
         }
@@ -200,7 +201,7 @@ pub async fn fetch(
         {
             let cur_mtime = meta.mtime_ns;
             if cur_mtime != Some(ns)
-                && let Err(e) = crate::fs::apply_metadata(&abs, None, Some(ns))
+                && let Err(e) = crate::utils::fs::apply_metadata(&abs, None, Some(ns))
             {
                 warn!("utime {}: {e}", abs.display());
             }

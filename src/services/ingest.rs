@@ -8,12 +8,15 @@ use std::{
 
 use crate::{
     debug,
-    fs::{self, FileMeta, FsError, Kind, Op},
     protocol::manifest::{
         FileEntry, Manifest,
         common::{MAX_BLOCK_SIZE, MAX_BLOCKS, MIN_BLOCK_SIZE, validate_path},
     },
-    utils::{format::format_bytes, progress::IngestProgress},
+    utils::{
+        format::format_bytes,
+        fs::{self, FileMeta, FsError, Kind, Op},
+        progress::IngestProgress,
+    },
 };
 
 const READ_BUF_SIZE: usize = 128 * 1024;
@@ -166,7 +169,7 @@ pub fn ingest(
             }
 
             for (abs, _, rel) in &paths {
-                let fmeta = crate::fs::metadata(abs).map_err(IngestError::Fs)?;
+                let fmeta = fs::metadata(abs).map_err(IngestError::Fs)?;
                 let entry = hash_file(
                     abs, rel, &fmeta, block_size, &mut pool, &mut index, &mut stats, progress,
                 )?;

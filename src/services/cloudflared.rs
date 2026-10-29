@@ -1,5 +1,10 @@
 use std::fmt;
 
+use crate::{
+    info,
+    utils::tty::{bold, green, purple, red, yellow},
+};
+
 pub const SOURCE_PAGE: &str = "https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/";
 
 pub const MIN: CalVer = CalVer {
@@ -7,6 +12,56 @@ pub const MIN: CalVer = CalVer {
     minor: 5,
     patch: 0,
 };
+
+pub fn check() -> Result<(), String> {
+    match std::process::Command::new(binary())
+        .arg("--version")
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let raw = String::from_utf8_lossy(&out.stdout);
+
+            // Based on the assumption that `cloudflared --version` returns the FIRST line in format,
+            // `cloudflared version YYYY.M.P (built YYYYMMDD-HH:MM:SS)`.
+            // (For YYYY.M.P, see `cloudflared::CalVer`)
+            let ver = raw.lines().next().unwrap_or("?").trim().to_string();
+
+            let src = if is_bundled() { "bundled" } else { "in PATH" };
+
+            match classify(parse_version(&raw)) {
+                Verdict::Supported(_) => {
+                    info!(
+                        "cloudflared: {} ({src}) - {ver}",
+                        bold(green("available").as_str())
+                    );
+                }
+                Verdict::TooOld(v) => {
+                    info!(
+                        "cloudflared: {}, need >= {} (have {v}) (see {})",
+                        bold(yellow("too old").as_str()),
+                        MIN,
+                        SOURCE_PAGE
+                    );
+                }
+                Verdict::Unknown => {
+                    info!(
+                        "cloudflared: {} ({src}) - {ver}",
+                        bold(purple("unknown").as_str())
+                    );
+                }
+            }
+        }
+        _ => {
+            info!(
+                "cloudflared: {} (see: {})",
+                bold(red("missing").as_str()),
+                SOURCE_PAGE
+            );
+        }
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CalVer {
@@ -28,7 +83,7 @@ pub enum Verdict {
     Unknown,
 }
 
-pub fn classify(v: Option<CalVer>) -> Verdict {
+fn classify(v: Option<CalVer>) -> Verdict {
     match v {
         Some(c) if c >= MIN => Verdict::Supported(c),
         Some(c) => Verdict::TooOld(c),
@@ -163,7 +218,7 @@ fn exe_dir() -> Option<std::path::PathBuf> {
 
 // Resolve the cloudflared binary: private prefix first, then next to the
 // `rh` executable, then `PATH` lookup.
-pub fn binary() -> std::path::PathBuf {
+fn binary() -> std::path::PathBuf {
     if let Some(data) = data_dir()
         && let Some(p) = private_path_in(&data)
     {
@@ -175,7 +230,7 @@ pub fn binary() -> std::path::PathBuf {
     std::path::PathBuf::from("cloudflared")
 }
 
-pub fn is_bundled() -> bool {
+fn is_bundled() -> bool {
     if let Some(data) = data_dir()
         && private_path_in(&data).is_some()
     {

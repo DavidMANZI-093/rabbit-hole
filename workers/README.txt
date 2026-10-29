@@ -163,7 +163,7 @@ release.
 ----------------
 
 Client and edge must agree on three values: code shape (6 hex), default TTL
-(14400), and route paths (/claim, /c/{code}). These are defined in src/edge.rs
-(client) and src/index.js (edge). Change them together. There is no version
+(14400), and route paths (/claim, /c/{code}). These are defined in
+src/services/edge.rs (client) and src/index.js (edge). Change them together. There is no version
 negotiation on the edge API. The file manifest protocol (RHB1) is versioned
 separately and is not affected by edge changes.

@@ -1,7 +1,6 @@
-pub mod cloudflared;
-pub mod edge;
-pub mod fs;
-pub mod ingest;
+pub mod cli;
+pub mod executor;
 pub mod protocol;
+pub mod report;
 pub mod services;
 pub mod utils;

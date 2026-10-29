@@ -2,9 +2,11 @@ use clap::{Parser, Subcommand};
 use std::{path::PathBuf, thread};
 
 use crate::{
-    edge::COMPILED_EDGE_BASE,
     protocol::manifest::common::{DEFAULT_BLOCK_SIZE, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE},
-    services::fetch::{DEFAULT_TIMEOUT_MS, MAX_CONCURRENCY, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS},
+    services::{
+        edge::COMPILED_EDGE_BASE,
+        fetch::{DEFAULT_TIMEOUT_MS, MAX_CONCURRENCY, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS},
+    },
 };
 
 #[derive(Parser)]

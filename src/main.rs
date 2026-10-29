@@ -1,6 +1,6 @@
 use clap::Parser;
+use rabbit_hole::cli::Cli;
 use rabbit_hole::error;
-use rabbit_hole::services::{cli::Cli, dispatch};
 use rabbit_hole::utils::{log, tty};
 
 #[tokio::main]
@@ -9,7 +9,7 @@ async fn main() {
     log::set_verbose(cli.verbose);
     tty::init(cli.no_color);
 
-    dispatch::run(cli.cmd).await.map_err(|e| {
+    cli.cmd.execute().await.map_err(|e| {
         error!("{}", e);
         std::process::exit(1);
     });
