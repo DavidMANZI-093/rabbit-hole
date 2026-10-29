@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use crate::{
     cli::Command,
     error, info,
-    report::{FetchSummary, print_fetch_summary, print_serve_details},
+    report::{FetchSummary, print_cloudflared_status, print_fetch_summary, print_serve_details},
     services::{
         cloudflared, edge,
         fetch::fetch,
@@ -59,7 +59,7 @@ impl Command {
                 })
                 .await
             }
-            Command::Check => cloudflared::check(),
+            Command::Check => run_check(),
         }
     }
 }
@@ -169,6 +169,11 @@ async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
             Err(e)
         }
     }
+}
+
+fn run_check() -> Result<(), String> {
+    print_cloudflared_status(&cloudflared::status());
+    Ok(())
 }
 
 // Resolves `code_or_url` to a full HTTPS URL.

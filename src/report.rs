@@ -2,13 +2,42 @@ use std::path::Path;
 
 use crate::{
     info,
-    services::fetch::FetchStats,
+    services::{cloudflared, fetch::FetchStats},
     utils::{
         format::format_bytes,
         progress::FetchSnapshot,
-        tty::{green, red},
+        tty::{bold, green, purple, red, yellow},
     },
 };
+
+pub fn print_cloudflared_status(status: &cloudflared::Status) {
+    let Some(line) = status.line.as_deref() else {
+        info!(
+            "cloudflared: {} (see: {})",
+            bold(red("missing").as_str()),
+            cloudflared::SOURCE_PAGE
+        );
+        return;
+    };
+
+    let src = if status.bundled { "bundled" } else { "in PATH" };
+    match status.verdict {
+        cloudflared::Verdict::Supported(_) => info!(
+            "cloudflared: {} ({src}) - {line}",
+            bold(green("available").as_str())
+        ),
+        cloudflared::Verdict::TooOld(v) => info!(
+            "cloudflared: {}, need >= {} (have {v}) (see {})",
+            bold(yellow("too old").as_str()),
+            cloudflared::MIN,
+            cloudflared::SOURCE_PAGE
+        ),
+        cloudflared::Verdict::Unknown => info!(
+            "cloudflared: {} ({src}) - {line}",
+            bold(purple("unknown").as_str())
+        ),
+    }
+}
 
 pub fn print_serve_details(
     lan: &str,

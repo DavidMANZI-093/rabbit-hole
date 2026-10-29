@@ -1,10 +1,5 @@
 use std::fmt;
 
-use crate::{
-    info,
-    utils::tty::{bold, green, purple, red, yellow},
-};
-
 pub const SOURCE_PAGE: &str = "https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/";
 
 pub const MIN: CalVer = CalVer {
@@ -12,56 +7,6 @@ pub const MIN: CalVer = CalVer {
     minor: 5,
     patch: 0,
 };
-
-pub fn check() -> Result<(), String> {
-    match std::process::Command::new(binary())
-        .arg("--version")
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            let raw = String::from_utf8_lossy(&out.stdout);
-
-            // Based on the assumption that `cloudflared --version` returns the FIRST line in format,
-            // `cloudflared version YYYY.M.P (built YYYYMMDD-HH:MM:SS)`.
-            // (For YYYY.M.P, see `cloudflared::CalVer`)
-            let ver = raw.lines().next().unwrap_or("?").trim().to_string();
-
-            let src = if is_bundled() { "bundled" } else { "in PATH" };
-
-            match classify(parse_version(&raw)) {
-                Verdict::Supported(_) => {
-                    info!(
-                        "cloudflared: {} ({src}) - {ver}",
-                        bold(green("available").as_str())
-                    );
-                }
-                Verdict::TooOld(v) => {
-                    info!(
-                        "cloudflared: {}, need >= {} (have {v}) (see {})",
-                        bold(yellow("too old").as_str()),
-                        MIN,
-                        SOURCE_PAGE
-                    );
-                }
-                Verdict::Unknown => {
-                    info!(
-                        "cloudflared: {} ({src}) - {ver}",
-                        bold(purple("unknown").as_str())
-                    );
-                }
-            }
-        }
-        _ => {
-            info!(
-                "cloudflared: {} (see: {})",
-                bold(red("missing").as_str()),
-                SOURCE_PAGE
-            );
-        }
-    }
-
-    Ok(())
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CalVer {
@@ -138,17 +83,48 @@ fn take_digits(b: &[u8], j: &mut usize, min: usize, max: usize) -> Option<u32> {
     Some(n)
 }
 
-pub fn probe() -> Verdict {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Status {
+    pub verdict: Verdict,
+    pub line: Option<String>,
+    pub bundled: bool,
+}
+
+impl Status {
+    fn from_output(output: Option<String>, bundled: bool) -> Self {
+        match output {
+            None => Self {
+                verdict: Verdict::Unknown,
+                line: None,
+                bundled,
+            },
+            Some(text) => Self {
+                verdict: classify(parse_version(&text)),
+                // `cloudflared --version` prints `cloudflared version ...` first.
+                line: Some(text.lines().next().unwrap_or("?").trim().to_string()),
+                bundled,
+            },
+        }
+    }
+}
+
+fn version_output() -> Option<String> {
     let out = std::process::Command::new(binary())
         .arg("--version")
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            classify(parse_version(&text))
-        }
-        _ => Verdict::Unknown,
-    }
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn probe() -> Verdict {
+    let output = version_output();
+    classify(output.as_deref().and_then(parse_version))
+}
+
+pub fn status() -> Status {
+    Status::from_output(version_output(), is_bundled())
 }
 
 pub fn command(origin: &str) -> tokio::process::Command {
@@ -290,6 +266,65 @@ mod tests {
             Verdict::TooOld(_)
         ));
         assert!(matches!(classify(None), Verdict::Unknown));
+    }
+
+    #[test]
+    fn status_supported_keeps_first_line() {
+        let s = Status::from_output(
+            Some("cloudflared version 2026.10.2 (built 20261020-20:51:21)\nextra\n".to_string()),
+            false,
+        );
+        assert_eq!(
+            s.verdict,
+            Verdict::Supported(CalVer {
+                year: 2026,
+                minor: 10,
+                patch: 2
+            })
+        );
+        assert_eq!(
+            s.line.as_deref(),
+            Some("cloudflared version 2026.10.2 (built 20261020-20:51:21)")
+        );
+        assert!(!s.bundled);
+    }
+
+    #[test]
+    fn status_reports_too_old_and_bundled() {
+        let s = Status::from_output(
+            Some("cloudflared version 2026.4.9 (built 20260401-00:00:00)".to_string()),
+            true,
+        );
+        assert_eq!(
+            s.verdict,
+            Verdict::TooOld(CalVer {
+                year: 2026,
+                minor: 4,
+                patch: 9
+            })
+        );
+        assert!(s.bundled);
+    }
+
+    #[test]
+    fn status_keeps_unparseable_line() {
+        let s = Status::from_output(Some("banana\n".to_string()), false);
+        assert_eq!(s.verdict, Verdict::Unknown);
+        assert_eq!(s.line.as_deref(), Some("banana"));
+    }
+
+    #[test]
+    fn status_missing_has_no_line() {
+        let s = Status::from_output(None, false);
+        assert_eq!(s.verdict, Verdict::Unknown);
+        assert!(s.line.is_none());
+    }
+
+    #[test]
+    fn status_empty_output_uses_placeholder() {
+        let s = Status::from_output(Some(String::new()), false);
+        assert_eq!(s.verdict, Verdict::Unknown);
+        assert_eq!(s.line.as_deref(), Some("?"));
     }
 
     #[test]
