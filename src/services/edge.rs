@@ -245,19 +245,21 @@ pub async fn try_release(client: &EdgeClient, code: &str) {
     }
 }
 
-// Returns the state directory for rh
-// Uses `~/.local/state/rh` as the fallback per the XDG Base Directory spec v0.8.
-fn state_dir() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute()) // spec: ignore if not absolute
-        .unwrap_or_else(|| {
-            // HOME is always set on any POSIX system; if somehow absent fall back to /tmp
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join(".local").join("state"))
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-        })
+// Split from state_dir so the path rules can be tested without env mutation.
+fn state_dir_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    xdg.filter(|p| p.is_absolute()) // spec: ignore if not absolute
+        .or_else(|| home.map(|h| h.join(".local").join("state")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("rh")
+}
+
+// Returns the state directory for rh. Uses `~/.local/state/rh` as the
+// fallback per the XDG Base Directory spec v0.8. See https://specifications.freedesktop.org/basedir/0.8/
+fn state_dir() -> PathBuf {
+    state_dir_from(
+        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
 }
 
 // Returns the per-serve-path memory file inside the XDG state dir.
@@ -377,28 +379,21 @@ mod tests {
 
     #[test]
     fn state_dir_with_absolute_xdg_state_home() {
-        // Safety: test binary is single-threaded by default; env mutation is safe in that context.
-        let dir = unsafe {
-            std::env::set_var("XDG_STATE_HOME", "/custom/state");
-            let d = state_dir();
-            std::env::remove_var("XDG_STATE_HOME");
-            d
-        };
+        let dir = state_dir_from(
+            Some(PathBuf::from("/custom/state")),
+            Some(PathBuf::from("/home/testuser")),
+        );
         assert_eq!(dir, PathBuf::from("/custom/state/rh"));
     }
 
     #[test]
     fn state_dir_ignores_relative_xdg_state_home() {
-        let dir = unsafe {
-            std::env::set_var("XDG_STATE_HOME", "relative/path");
-            std::env::set_var("HOME", "/home/testuser");
-            let d = state_dir();
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::remove_var("HOME");
-            d
-        };
+        let dir = state_dir_from(
+            Some(PathBuf::from("relative/path")),
+            Some(PathBuf::from("/home/testuser")),
+        );
         // relative XDG_STATE_HOME must be ignored; should fall back to HOME
-        assert!(dir.starts_with("/home/testuser"), "got: {dir:?}");
+        assert_eq!(dir, PathBuf::from("/home/testuser/.local/state/rh"));
     }
 
     // --- remember_code early exits ---
