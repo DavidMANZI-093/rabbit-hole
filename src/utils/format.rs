@@ -1,3 +1,6 @@
+// Copyright (c) 2026 David MANZI
+// SPDX-License-Identifier: MIT
+
 use std::borrow::Cow;
 
 const MAX_PATH_WIDTH: usize = 60;

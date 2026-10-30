@@ -1,3 +1,6 @@
+// Copyright (c) 2026 David MANZI
+// SPDX-License-Identifier: MIT
+
 use crate::protocol::manifest::common::{
     MAX_BLOCK_SIZE, MAX_BLOCKS, MAX_FILES, MAX_MANIFEST_BYTES, MAX_PATH_LEN, MIN_BLOCK_SIZE,
     ManifestError, expected_chunks, validate_path,

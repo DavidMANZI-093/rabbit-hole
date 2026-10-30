@@ -1,3 +1,6 @@
+// Copyright (c) 2026 David MANZI
+// SPDX-License-Identifier: MIT
+
 use clap::Parser;
 use rabbit_hole::cli::Cli;
 use rabbit_hole::error;

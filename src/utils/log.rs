@@ -1,3 +1,6 @@
+// Copyright (c) 2026 David MANZI
+// SPDX-License-Identifier: MIT
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::utils::tty::{bold, clear_headline, purple, red, yellow};

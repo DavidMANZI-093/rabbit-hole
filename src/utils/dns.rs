@@ -1,3 +1,6 @@
+// Copyright (c) 2026 David MANZI
+// SPDX-License-Identifier: MIT
+
 use std::{net::SocketAddr, time::Duration};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 David MANZI
+// SPDX-License-Identifier: MIT
+
 use std::{
     net::{IpAddr, Ipv4Addr, UdpSocket},
     time::Duration,

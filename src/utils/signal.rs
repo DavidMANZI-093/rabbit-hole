@@ -1,3 +1,6 @@
+// Copyright (c) 2026 David MANZI
+// SPDX-License-Identifier: MIT
+
 // Resolves on Ctrl-C (SIGINT) or SIGTERM (unix only).
 pub async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();

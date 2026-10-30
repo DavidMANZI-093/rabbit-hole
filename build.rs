@@ -1,3 +1,6 @@
+// Copyright (c) 2026 David MANZI
+// SPDX-License-Identifier: MIT
+
 fn main() {
     // Set `RH_EDGE_BASE` in environment before building a release.
     // Builds without it will produce an empty default, causing a runtime error

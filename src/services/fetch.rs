@@ -1,3 +1,6 @@
+// Copyright (c) 2026 David MANZI
+// SPDX-License-Identifier: MIT
+
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use reqwest::Client;

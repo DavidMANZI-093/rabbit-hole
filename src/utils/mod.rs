@@ -1,3 +1,6 @@
+// Copyright (c) 2026 David MANZI
+// SPDX-License-Identifier: MIT
+
 pub mod dns;
 pub mod format;
 pub mod fs;

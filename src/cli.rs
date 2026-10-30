@@ -1,3 +1,6 @@
+// Copyright (c) 2026 David MANZI
+// SPDX-License-Identifier: MIT
+
 use clap::{Parser, Subcommand};
 use std::{path::PathBuf, thread};
 

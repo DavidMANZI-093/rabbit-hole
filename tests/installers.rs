@@ -1,3 +1,6 @@
+// Copyright (c) 2026 David MANZI
+// SPDX-License-Identifier: MIT
+
 // Cross-file consistency checks for the installer scripts.
 
 fn read(rel: &str) -> String {
