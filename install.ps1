@@ -30,7 +30,7 @@ if ([string]::IsNullOrEmpty($Version)) {
     Write-Host "  resolving latest rh release..."
     $latest = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
     $Version = $latest.tag_name
-    if ([string]::IsNullOrEmpty($Version)) { throw "could not resolve latest release (pass -Version vX.Y.Z)" }
+    if ([string]::IsNullOrEmpty($Version)) { throw "could not resolve latest release" }
 }
 Write-Host "  rh $Version for $Target"
 

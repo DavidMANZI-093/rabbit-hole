@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "error: run this installer with bash" >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 # ------ variables ------
@@ -52,7 +58,11 @@ esac
 
 if [[ -z "${RH_VERSION:-}" ]]; then
   log "resolving latest rh release..."
-  RH_VERSION="$(curl -fsSL --proto=https "https://api.github.com/repos/$RH_REPO/releases/latest" | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+  RH_VERSION="$(
+    curl -fsSL --proto '=https' --proto-redir '=https' \
+      "https://api.github.com/repos/$RH_REPO/releases/latest" |
+      awk -F'"' '/"tag_name"/ && !seen { tag = $4; seen = 1 } END { print tag }'
+  )" || RH_VERSION=""
   [[ -n "$RH_VERSION" ]] || {
     echo "error: could not resolve latest release (set RH_VERSION=vX.Y.Z)" >&2
     exit 1
@@ -77,7 +87,7 @@ if [[ -n "$INSTALLED_RH" ]] && [[ "v$INSTALLED_RH" = "$RH_VERSION" ]]; then
   log "rh $RH_VERSION already installed — skipping"
 else
   log "downloading rh $RH_VERSION..."
-  run curl -fsSL -o "$TMP/rh.zip" --proto=https "https://github.com/$RH_REPO/releases/download/$RH_VERSION/rh-$RH_VERSION-$TARGET.zip"
+  run curl -fsSL --proto '=https' --proto-redir '=https' -o "$TMP/rh.zip" "https://github.com/$RH_REPO/releases/download/$RH_VERSION/rh-$RH_VERSION-$TARGET.zip"
   run mkdir -p "$RH_PREFIX/bin"
   run unzip -o -q "$TMP/rh.zip" -d "$TMP/rh-out"
   run install -m 755 "$TMP/rh-out/rh" "$RH_PREFIX/bin/rh"
@@ -89,11 +99,11 @@ if [[ "$WITH_CLOUDFLARED" = "1" ]]; then
   PIN_URL="https://raw.githubusercontent.com/$RH_REPO/$RH_VERSION/third-party/cloudflared.pin"
   log "fetching pin file..."
   if [[ "$RH_DRY_RUN" = "1" ]]; then
-    printf '  + curl -fsSL -o PIN --proto=https %s\n' "$PIN_URL"
+    printf '  + curl -fsSL --proto "=https" --proto-redir "=https" -o PIN %s\n' "$PIN_URL"
     CF_VERSION="<from pin>"
     CF_SHA="<from pin>"
   else
-    curl -fsSL -o "$TMP/cloudflared.pin" --proto=https "$PIN_URL" ||
+    curl -fsSL --proto '=https' --proto-redir '=https' -o "$TMP/cloudflared.pin" "$PIN_URL" ||
       {
         echo "error: could not fetch $PIN_URL" >&2
         exit 1
@@ -114,7 +124,7 @@ if [[ "$WITH_CLOUDFLARED" = "1" ]]; then
   if [[ -n "$INSTALLED_CF" ]] && [[ "$INSTALLED_CF" = "$CF_VERSION" ]]; then
     log "cloudflared $CF_VERSION already installed — skipping"
   else
-    run curl -fsSL -o "$TMP/cf-asset" --proto=https "https://github.com/cloudflare/cloudflared/releases/download/$CF_VERSION/$CF_ASSET"
+    run curl -fsSL --proto '=https' --proto-redir '=https' -o "$TMP/cf-asset" "https://github.com/cloudflare/cloudflared/releases/download/$CF_VERSION/$CF_ASSET"
     case "$CF_ASSET" in
     *.tgz)
       CF_BIN="$TMP/cf-asset-bin"
@@ -153,5 +163,5 @@ case ":$PATH:" in
 *":$RH_PREFIX/bin:"*) ;;
 *) log "add to PATH, e.g.:  export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
-log "to uninstall later: curl -fsSL --proto=https https://raw.githubusercontent.com/$RH_REPO/$RH_VERSION/uninstall.sh | sh"
+log "to uninstall later: curl -fsSL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/$RH_REPO/$RH_VERSION/uninstall.sh | bash"
 log "done. Run:  rh check"

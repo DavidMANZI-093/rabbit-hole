@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "error: run this uninstaller with bash" >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 RH_PREFIX="${RH_PREFIX:-$HOME/.local}"
