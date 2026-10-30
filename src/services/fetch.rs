@@ -1,7 +1,12 @@
 // Copyright (c) 2026 David MANZI
 // SPDX-License-Identifier: MIT
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use reqwest::Client;
 
@@ -42,14 +47,14 @@ pub async fn fetch(
     let client = build_client(&base, timeout).await?;
     let (manifest, wire_len) = pull_manifest(&client, &base, bearer.as_deref()).await?;
 
-    prepare_dest(dest, force)?;
+    let preflight = preflight_dest(dest, &manifest, force)?;
     let files = Arc::new(create_outputs(dest, &manifest).await?);
-    let targets = plan_blocks(&manifest);
+    let targets = plan_blocks(&manifest, &preflight.verified);
     let n_unique = targets.len();
     let bytes_total: u64 = manifest.files.iter().map(|f| f.size).sum();
 
     info!(
-        "manifest size {}, {}:v{} protocol\nfiles {} ({} total, {} blocks)",
+        "manifest size {}, {}:v{} protocol\nfiles {} ({} total, {} blocks to fetch)",
         format_bytes(wire_len),
         std::str::from_utf8(&MAGIC).unwrap_or("?"),
         CURRENT,
@@ -120,7 +125,7 @@ async fn create_outputs(dest: &Path, manifest: &Manifest) -> Result<Vec<OutputFi
         let file = tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(&abs)
             .await
             .map_err(|e| format!("create {}: {e}", abs.display()))?;
@@ -138,11 +143,14 @@ async fn create_outputs(dest: &Path, manifest: &Manifest) -> Result<Vec<OutputFi
 
 type BlockTargets = HashMap<[u8; 32], Vec<(usize, u64)>>;
 
-fn plan_blocks(manifest: &Manifest) -> BlockTargets {
+fn plan_blocks(manifest: &Manifest, verified: &[Vec<bool>]) -> BlockTargets {
     let bs = manifest.block_size as u64;
     let mut targets = BlockTargets::new();
     for (fi, f) in manifest.files.iter().enumerate() {
         for (j, idx) in f.chunks.iter().enumerate() {
+            if verified[fi][j] {
+                continue;
+            }
             let digest = manifest.pool[*idx as usize];
             targets.entry(digest).or_default().push((fi, j as u64 * bs));
         }
@@ -389,7 +397,13 @@ fn decode_error(e: ManifestError) -> String {
     }
 }
 
-fn prepare_dest(dest: &Path, force: bool) -> Result<(), String> {
+#[derive(Debug)]
+struct Preflight {
+    verified: Vec<Vec<bool>>,
+    conflicts: Vec<PathBuf>,
+}
+
+fn preflight_dest(dest: &Path, manifest: &Manifest, force: bool) -> Result<Preflight, String> {
     if dest.exists() {
         if !dest.is_dir() {
             return Err(format!(
@@ -397,21 +411,86 @@ fn prepare_dest(dest: &Path, force: bool) -> Result<(), String> {
                 dest.display()
             ));
         }
-
-        let non_empty = std::fs::read_dir(dest)
-            .map_err(|e| e.to_string())?
-            .next()
-            .is_some();
-        if non_empty && !force {
-            return Err(format!(
-                "dest {} is not empty — pass --force to fetch into it anyway",
-                dest.display()
-            ));
-        }
     } else {
         std::fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
     }
-    Ok(())
+
+    let block_size = manifest.block_size as u64;
+    let mut preflight = Preflight {
+        verified: manifest
+            .files
+            .iter()
+            .map(|f| vec![false; f.chunks.len()])
+            .collect(),
+        conflicts: Vec::new(),
+    };
+
+    for (fi, f) in manifest.files.iter().enumerate() {
+        let abs = dest.join(&f.path);
+        let meta = match std::fs::symlink_metadata(&abs) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("stat {}: {e}", abs.display())),
+        };
+        if !meta.file_type().is_file() {
+            return Err(format!(
+                "target {} exists and is not a regular file; remove it manually",
+                abs.display()
+            ));
+        }
+
+        let file = std::fs::File::open(&abs).map_err(|e| format!("open {}: {e}", abs.display()))?;
+        let file_len = meta.len();
+        let mut all_match = file_len == f.size;
+        for (j, chunk) in f.chunks.iter().enumerate() {
+            let offset = j as u64 * block_size;
+            let len = block_size.min(f.size.saturating_sub(offset)) as usize;
+            if file_len >= offset + len as u64
+                && block_matches(&file, offset, len, &manifest.pool[*chunk as usize])
+            {
+                preflight.verified[fi][j] = true;
+            } else {
+                all_match = false;
+            }
+        }
+        if !all_match {
+            preflight.conflicts.push(abs);
+        }
+    }
+
+    if !preflight.conflicts.is_empty() && !force {
+        let mut msg = format!(
+            "dest {} contains {} target file(s) that differ from the share:",
+            dest.display(),
+            preflight.conflicts.len()
+        );
+        for p in preflight.conflicts.iter().take(5) {
+            msg.push_str(&format!("\n  {}", p.display()));
+        }
+        if preflight.conflicts.len() > 5 {
+            msg.push_str(&format!(
+                "\n  ... and {} more",
+                preflight.conflicts.len() - 5
+            ));
+        }
+        msg.push_str("\npass --force to replace only those files");
+        return Err(msg);
+    }
+
+    Ok(preflight)
+}
+
+fn block_matches(file: &std::fs::File, offset: u64, len: usize, want: &[u8; 32]) -> bool {
+    let mut buf = vec![0u8; len];
+    let mut done = 0;
+    while done < len {
+        match utils::fs::read_at(file, &mut buf[done..], offset + done as u64) {
+            Ok(0) => return false,
+            Ok(n) => done += n,
+            Err(_) => return false,
+        }
+    }
+    blake3::hash(&buf).as_bytes() == want
 }
 
 enum BlockError {
@@ -613,9 +692,73 @@ mod tests {
             ],
         };
 
-        let targets = plan_blocks(&manifest);
+        let targets = plan_blocks(&manifest, &[vec![false, false], vec![false]]);
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[&first], vec![(0, 0), (1, 0)]);
+        assert_eq!(targets[&second], vec![(0, 4096)]);
+    }
+
+    #[test]
+    fn plan_blocks_skips_verified_locations() {
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+        let manifest = Manifest {
+            block_size: 4096,
+            pool: vec![first, second],
+            root: None,
+            files: vec![
+                FileEntry {
+                    path: "a".into(),
+                    size: 8192,
+                    mode: None,
+                    mtime_ns: None,
+                    chunks: vec![0, 1],
+                },
+                FileEntry {
+                    path: "b".into(),
+                    size: 4096,
+                    mode: None,
+                    mtime_ns: None,
+                    chunks: vec![0],
+                },
+            ],
+        };
+
+        let targets = plan_blocks(&manifest, &[vec![false, true], vec![true]]);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[&first], vec![(0, 0)]);
+        assert!(!targets.contains_key(&second));
+    }
+
+    #[test]
+    fn plan_blocks_keeps_shared_digest_when_one_location_is_missing() {
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+        let manifest = Manifest {
+            block_size: 4096,
+            pool: vec![first, second],
+            root: None,
+            files: vec![
+                FileEntry {
+                    path: "a".into(),
+                    size: 8192,
+                    mode: None,
+                    mtime_ns: None,
+                    chunks: vec![0, 1],
+                },
+                FileEntry {
+                    path: "b".into(),
+                    size: 4096,
+                    mode: None,
+                    mtime_ns: None,
+                    chunks: vec![0],
+                },
+            ],
+        };
+
+        let targets = plan_blocks(&manifest, &[vec![true, false], vec![false]]);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[&first], vec![(1, 0)]);
         assert_eq!(targets[&second], vec![(0, 4096)]);
     }
 
@@ -653,48 +796,123 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // --- prepare_dest ---
+    // --- preflight_dest ---
 
-    #[test]
-    fn creates_missing_directory() {
-        let dir = std::env::temp_dir().join(format!("rh-test-{}", std::process::id()));
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rh-preflight-{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(prepare_dest(&dir, false).is_ok());
+        dir
+    }
+
+    fn one_block_manifest(bytes: &[u8]) -> Manifest {
+        Manifest {
+            block_size: 4096,
+            pool: vec![*blake3::hash(bytes).as_bytes()],
+            root: None,
+            files: vec![FileEntry {
+                path: "a.txt".into(),
+                size: bytes.len() as u64,
+                mode: None,
+                mtime_ns: None,
+                chunks: vec![0],
+            }],
+        }
+    }
+
+    #[test]
+    fn preflight_creates_missing_directory() {
+        let dir = temp_dir("missing");
+        let manifest = one_block_manifest(b"hello");
+        let preflight = preflight_dest(&dir, &manifest, false).expect("preflight");
         assert!(dir.is_dir());
+        assert!(preflight.conflicts.is_empty());
+        assert!(!preflight.verified[0][0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn accepts_existing_empty_directory() {
-        let dir = std::env::temp_dir().join(format!("rh-test-empty-{}", std::process::id()));
+    fn preflight_accepts_existing_empty_directory() {
+        let dir = temp_dir("empty");
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(prepare_dest(&dir, false).is_ok());
+        let manifest = one_block_manifest(b"hello");
+        let preflight = preflight_dest(&dir, &manifest, false).expect("preflight");
+        assert!(preflight.conflicts.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn rejects_non_empty_directory_without_force() {
-        let dir = std::env::temp_dir().join(format!("rh-test-nonempty-{}", std::process::id()));
+    fn preflight_ignores_unrelated_files() {
+        let dir = temp_dir("unrelated");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("file.txt"), b"data").unwrap();
-        assert!(prepare_dest(&dir, false).is_err());
+        std::fs::write(dir.join("unrelated.txt"), b"keep me").unwrap();
+        let manifest = one_block_manifest(b"hello");
+        let preflight = preflight_dest(&dir, &manifest, false).expect("preflight");
+        assert!(preflight.conflicts.is_empty());
+        assert_eq!(
+            std::fs::read(dir.join("unrelated.txt")).unwrap(),
+            b"keep me"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn accepts_non_empty_directory_with_force() {
-        let dir = std::env::temp_dir().join(format!("rh-test-force-{}", std::process::id()));
+    fn preflight_accepts_matching_target_without_force() {
+        let dir = temp_dir("matching");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("file.txt"), b"data").unwrap();
-        assert!(prepare_dest(&dir, true).is_ok());
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        let manifest = one_block_manifest(b"hello");
+        let preflight = preflight_dest(&dir, &manifest, false).expect("preflight");
+        assert!(preflight.conflicts.is_empty());
+        assert!(preflight.verified[0][0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn rejects_dest_that_is_a_file() {
-        let file = std::env::temp_dir().join(format!("rh-test-file-{}", std::process::id()));
-        std::fs::write(&file, b"data").unwrap();
-        assert!(prepare_dest(&file, false).is_err());
-        std::fs::remove_file(&file).ok();
+    fn preflight_rejects_differing_target_without_force() {
+        let dir = temp_dir("differing");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"other").unwrap();
+        let manifest = one_block_manifest(b"hello");
+        let err = preflight_dest(&dir, &manifest, false).expect_err("must conflict");
+        assert!(err.contains("a.txt"), "unexpected error: {err}");
+        assert!(err.contains("--force"), "unexpected error: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preflight_accepts_differing_target_with_force() {
+        let dir = temp_dir("force");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"other").unwrap();
+        let manifest = one_block_manifest(b"hello");
+        let preflight = preflight_dest(&dir, &manifest, true).expect("preflight");
+        assert_eq!(preflight.conflicts.len(), 1);
+        assert!(!preflight.verified[0][0]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preflight_rejects_non_regular_target() {
+        let dir = temp_dir("nonregular");
+        std::fs::create_dir_all(dir.join("a.txt")).unwrap();
+        let manifest = one_block_manifest(b"hello");
+        assert!(preflight_dest(&dir, &manifest, true).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preflight_rejects_dest_that_is_a_file() {
+        let dir = temp_dir("destfile");
+        std::fs::write(&dir, b"data").unwrap();
+        let manifest = one_block_manifest(b"hello");
+        assert!(preflight_dest(&dir, &manifest, false).is_err());
+        std::fs::remove_file(&dir).ok();
     }
 }

@@ -110,17 +110,19 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
     let port = server.port();
     let lan_url: String = format!("http://{}:{port}", lan_ip());
 
-    let wan = tunnel::start(port).await;
+    let wan = if opts.local {
+        None
+    } else {
+        tunnel::start(port).await
+    };
     let wan_url = wan.as_ref().map(|t| t.url.as_str());
-    let code = edge::remember_code(&opts.edge, wan_url, &opts.path).await;
+    let code = if opts.local {
+        None
+    } else {
+        edge::remember_code(&opts.edge, wan_url, &opts.path).await
+    };
 
-    print_serve_details(
-        &lan_url,
-        wan_url,
-        code.as_deref(),
-        token.as_deref(),
-        opts.local,
-    );
+    print_serve_details(&lan_url, wan_url, code.as_deref(), token.as_deref());
 
     if let Err(e) = server.run_until_shutdown().await {
         error!("{e}");

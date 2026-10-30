@@ -42,56 +42,34 @@ pub fn print_cloudflared_status(status: &cloudflared::Status) {
     }
 }
 
-pub fn print_serve_details(
-    lan: &str,
-    wan: Option<&str>,
-    code: Option<&str>,
-    token: Option<&str>,
-    show_local: bool,
-) {
+pub fn print_serve_details(lan: &str, wan: Option<&str>, code: Option<&str>, token: Option<&str>) {
+    let tab_n_align = |name: &str, value: &str| -> String { format!("    {name:>7}: {value}") };
     if let Some(wan_url) = wan {
-        let tab_n_align = |name: &str, value: &str| -> String { format!("    {name:>7}: {value}") };
         info!("{}", tab_n_align("url", wan_url));
-        if show_local {
-            info!("{}", tab_n_align("local", lan));
-        }
-        match token {
-            Some(t) => {
-                info!("{}", tab_n_align("secured", "true"));
-                if let Some(c) = code {
-                    info!("{}", tab_n_align("code", c));
-                }
-                info!("{}", tab_n_align("token", t));
+    }
+    info!("{}", tab_n_align("local", lan));
+    match token {
+        Some(t) => {
+            info!("{}", tab_n_align("secured", "true"));
+            if let Some(c) = code {
+                info!("{}", tab_n_align("code", c));
             }
-            None => {
-                info!(
-                    "{}",
-                    tab_n_align("secured", "false (secure with '--secure' flag)")
-                );
-                if let Some(c) = code {
-                    info!("{}", tab_n_align("code", c));
-                }
+            info!("{}", tab_n_align("token", t));
+        }
+        None => {
+            info!(
+                "{}",
+                tab_n_align("secured", "false (secure with '--secure' flag)")
+            );
+            if let Some(c) = code {
+                info!("{}", tab_n_align("code", c));
             }
         }
     }
 
-    let target = wan.unwrap_or(lan);
-    let fetch_cmd = match token {
-        Some(_) => {
-            if let Some(c) = code {
-                format!("`rh fetch {c} <dest> --bearer <token>`")
-            } else {
-                format!("`rh fetch {target} <dest> --bearer <token>`")
-            }
-        }
-        None => {
-            if let Some(c) = code {
-                format!("`rh fetch {c} <dest>`")
-            } else {
-                format!("`rh fetch {target} <dest>`")
-            }
-        }
-    };
+    let target = code.or(wan).unwrap_or(lan);
+    let bearer = token.map(|t| format!(" --bearer {t}")).unwrap_or_default();
+    let fetch_cmd = format!("`rh fetch {target} <dest>{bearer}`");
 
     info!("");
     info!("fetch with, {}", fetch_cmd);
@@ -137,14 +115,9 @@ impl FetchSummary {
 }
 
 pub fn print_fetch_summary(summary: &FetchSummary, dest: &Path) {
-    let status = if summary.ok { "done" } else { "failed" };
+    let status = if summary.ok { "done" } else { &red("failed") };
     let line = summary_line(summary, dest);
     let rest = line.strip_prefix(status).unwrap_or(&line);
-    let status = if summary.ok {
-        green(status)
-    } else {
-        red(status)
-    };
     info!("");
     info!("{status}{rest}");
     info!("");
