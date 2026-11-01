@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-if [ -z "${BASH_VERSION:-}" ]; then
+if [[ -z "${BASH_VERSION:-}" ]]; then
   echo "error: run this installer with bash" >&2
   exit 1
 fi
