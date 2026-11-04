@@ -16,6 +16,7 @@ use crate::{utils::tty::Dots, warn};
 
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(45);
+const DNS_REFRESH: Duration = Duration::from_secs(10);
 
 // Why a tunnel never materialized. Typed so callers blame accurately
 // instead of printing one misleading message for every failure.
@@ -30,12 +31,7 @@ pub async fn start(port: u16) -> Option<Tunnel> {
     match spawn(port).await {
         Ok(t) => {
             t.watch_exit();
-            status.message("resolving dns");
-            let live = t.wait_until_live().await;
             status.finish();
-            if !live {
-                warn!("tunnel URL not yet reachable at edge — sharing anyway");
-            }
             Some(t)
         }
         Err(SpawnError::NotInstalled(e)) => {
@@ -61,6 +57,7 @@ async fn spawn(port: u16) -> Result<Tunnel, SpawnError> {
     let origin = format!("http://127.0.0.1:{port}");
 
     let mut child = super::cloudflared::command(&origin)
+        .await
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -119,7 +116,17 @@ impl Tunnel {
         let _ = child.wait().await;
     }
 
-    async fn wait_until_live(&self) -> bool {
+    pub async fn wait_until_live(&self) -> bool {
+        let status = Dots::start("resolving dns");
+        let live = self.probe_until_live().await;
+        status.finish();
+        if !live {
+            warn!("tunnel URL not yet reachable at edge — sharing anyway");
+        }
+        live
+    }
+
+    async fn probe_until_live(&self) -> bool {
         let probe = format!("{}/__rh__/health", self.url);
         let host = self
             .url
@@ -132,22 +139,22 @@ impl Tunnel {
             .to_string();
 
         let start = tokio::time::Instant::now();
+        let mut client = probe_client(&host).await;
+        let mut refresh_at = tokio::time::Instant::now() + DNS_REFRESH;
+
         while start.elapsed() < LIVE_TIMEOUT {
-            let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(3));
-            if host.ends_with(".trycloudflare.com") {
-                let state = crate::utils::dns::resolve_all_doh(&host).await;
-
-                if !state.addrs.is_empty() {
-                    builder = builder.resolve_to_addrs(&host, &state.addrs);
-                }
-            }
-
-            if let Ok(client) = builder.build()
+            if let Some(c) = client.as_ref()
                 && let Ok(Ok(r)) =
-                    tokio::time::timeout(Duration::from_secs(3), client.get(&probe).send()).await
+                    tokio::time::timeout(Duration::from_secs(3), c.get(&probe).send()).await
                 && r.status().is_success()
             {
                 return true;
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= refresh_at {
+                client = probe_client(&host).await;
+                refresh_at = now + DNS_REFRESH;
             }
 
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -180,6 +187,17 @@ impl Tunnel {
             }
         });
     }
+}
+
+async fn probe_client(host: &str) -> Option<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(3));
+    if host.ends_with(".trycloudflare.com") {
+        let state = crate::utils::dns::resolve_all_doh(host).await;
+        if !state.addrs.is_empty() {
+            builder = builder.resolve_to_addrs(host, &state.addrs);
+        }
+    }
+    builder.build().ok()
 }
 
 fn sniff_url(line: &str) -> Option<String> {

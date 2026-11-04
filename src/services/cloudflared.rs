@@ -130,9 +130,9 @@ pub fn status() -> Status {
     Status::from_output(version_output(), is_bundled())
 }
 
-pub fn command(origin: &str) -> tokio::process::Command {
-    let compat = match probe() {
-        Verdict::TooOld(v) => {
+pub async fn command(origin: &str) -> tokio::process::Command {
+    let compat = match tokio::task::spawn_blocking(probe).await {
+        Ok(Verdict::TooOld(v)) => {
             crate::warn!("cloudflared version is old, need >= {} (have {v})", MIN);
             true
         }

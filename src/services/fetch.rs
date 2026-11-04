@@ -13,7 +13,7 @@ use reqwest::Client;
 use crate::{
     error, info,
     protocol::manifest::{
-        CURRENT, Manifest,
+        self, CURRENT, Manifest,
         common::{ManifestError, hex_encode},
         v1::MAGIC,
     },
@@ -46,10 +46,22 @@ pub async fn fetch(
     let base = normalize_base(url)?;
     let client = build_client(&base, timeout).await?;
     let (manifest, wire_len) = pull_manifest(&client, &base, bearer.as_deref()).await?;
+    let manifest = Arc::new(manifest);
 
-    let preflight = preflight_dest(dest, &manifest, force)?;
-    let files = Arc::new(create_outputs(dest, &manifest).await?);
-    let targets = plan_blocks(&manifest, &preflight.verified);
+    let (files, targets) = {
+        let dest = dest.to_path_buf();
+        let manifest = manifest.clone();
+        tokio::task::spawn_blocking(move || {
+            let preflight = preflight_dest(&dest, &manifest, force)?;
+            let files = create_outputs(&dest, &manifest, &preflight.needs_write)?;
+            let targets = plan_blocks(&manifest, &preflight.verified);
+            Ok::<_, String>((files, targets))
+        })
+        .await
+        .map_err(|e| format!("prepare destination: {e}"))??
+    };
+    let files = Arc::new(files);
+
     let n_unique = targets.len();
     let bytes_total: u64 = manifest.files.iter().map(|f| f.size).sum();
 
@@ -75,9 +87,17 @@ pub async fn fetch(
     );
     fetcher.run(targets).await?;
 
-    sync_outputs(&files)?;
-    drop(files);
-    restore_metadata(dest, &manifest)?;
+    {
+        let dest = dest.to_path_buf();
+        let manifest = manifest.clone();
+        tokio::task::spawn_blocking(move || {
+            sync_outputs(files.as_slice())?;
+            drop(files);
+            restore_metadata(&dest, &manifest)
+        })
+        .await
+        .map_err(|e| format!("finalize output: {e}"))??;
+    }
 
     Ok(FetchStats {
         files: manifest.files.len(),
@@ -107,33 +127,43 @@ fn tunnel_host(base: &str) -> Option<&str> {
 }
 
 struct OutputFile {
-    file: std::fs::File,
+    file: Option<std::fs::File>,
     path: String,
     size: u64,
 }
 
-async fn create_outputs(dest: &Path, manifest: &Manifest) -> Result<Vec<OutputFile>, String> {
+fn create_outputs(
+    dest: &Path,
+    manifest: &Manifest,
+    needs_write: &[bool],
+) -> Result<Vec<OutputFile>, String> {
     let mut out = Vec::with_capacity(manifest.files.len());
-    for f in &manifest.files {
+    for (fi, f) in manifest.files.iter().enumerate() {
+        if !needs_write[fi] {
+            out.push(OutputFile {
+                file: None,
+                path: f.path.clone(),
+                size: f.size,
+            });
+            continue;
+        }
+
         let abs = dest.join(&f.path);
         if let Some(parent) = abs.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
+            std::fs::create_dir_all(parent)
                 .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
 
-        let file = tokio::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
             .open(&abs)
-            .await
             .map_err(|e| format!("create {}: {e}", abs.display()))?;
-        let file = file.into_std().await;
 
         utils::fs::preallocate(&file, f.size).map_err(|e| format!("prealloc {}: {e}", f.path))?;
         out.push(OutputFile {
-            file,
+            file: Some(file),
             path: f.path.clone(),
             size: f.size,
         });
@@ -164,7 +194,7 @@ struct Fetcher {
     base: Arc<str>,
     token: Option<Arc<str>>,
     files: Arc<Vec<OutputFile>>,
-    sem: Arc<tokio::sync::Semaphore>,
+    concurrency: usize,
     progress: FetchProgress,
 }
 
@@ -182,26 +212,40 @@ impl Fetcher {
             base: Arc::from(base),
             token: token.map(Arc::from),
             files,
-            sem: Arc::new(tokio::sync::Semaphore::new(concurrency.max(1) as usize)),
+            concurrency: concurrency.max(1) as usize,
             progress,
         }
     }
 
     async fn run(self, targets: BlockTargets) -> Result<(), String> {
-        let mut tasks = Vec::with_capacity(targets.len());
+        let mut set = tokio::task::JoinSet::new();
+        let mut failed = 0usize;
+        let mut err_lines: Vec<String> = Vec::new();
+
         for (digest, locs) in targets {
+            if set.len() >= self.concurrency
+                && let Some(res) = set.join_next().await
+            {
+                record_task(res, &self.progress, &mut failed, &mut err_lines);
+            }
+
             let fetcher = self.clone();
-            tasks.push(tokio::spawn(async move {
-                let _permit = fetcher
-                    .sem
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                fetcher.download(digest, &locs).await
-            }));
+            set.spawn(async move { fetcher.download(digest, &locs).await });
         }
-        join_all(tasks, &self.progress).await
+
+        while let Some(res) = set.join_next().await {
+            record_task(res, &self.progress, &mut failed, &mut err_lines);
+        }
+
+        for e in err_lines {
+            error!("{e}");
+        }
+
+        if failed == 0 {
+            Ok(())
+        } else {
+            Err(format!("{failed} block(s) failed — dest is incomplete"))
+        }
     }
 
     async fn download(&self, digest: [u8; 32], locs: &[(usize, u64)]) -> Result<(), String> {
@@ -227,8 +271,16 @@ impl Fetcher {
             .await
             {
                 Ok(data) => {
-                    self.write_block(&data, locs, &hex)?;
-                    self.progress.add_bytes(data.len() as u64);
+                    let data_len = data.len() as u64;
+                    let files = Arc::clone(&self.files);
+                    let locs = locs.to_vec();
+                    let write_hex = hex.clone();
+                    tokio::task::spawn_blocking(move || {
+                        write_block(&files, &data, &locs, &write_hex)
+                    })
+                    .await
+                    .map_err(|e| format!("block {hex}: write task: {e}"))??;
+                    self.progress.add_bytes(data_len);
                     self.progress.inc_blocks();
                     return Ok(());
                 }
@@ -246,51 +298,49 @@ impl Fetcher {
 
         Err(last_err)
     }
-
-    fn write_block(&self, data: &[u8], locs: &[(usize, u64)], hex: &str) -> Result<(), String> {
-        for &(fi, off) in locs {
-            let target = &self.files[fi];
-            let len = (data.len() as u64).min(target.size.saturating_sub(off));
-            if let Err(e) = crate::utils::fs::write_at(&target.file, &data[..len as usize], off) {
-                return Err(format!("write block {hex} at {off}: {e}"));
-            }
-        }
-        Ok(())
-    }
 }
 
 const MAX_REPORTED_ERRORS: usize = 5;
 
-async fn join_all(
-    tasks: Vec<tokio::task::JoinHandle<Result<(), String>>>,
-    progress: &FetchProgress,
+fn write_block(
+    files: &[OutputFile],
+    data: &[u8],
+    locs: &[(usize, u64)],
+    hex: &str,
 ) -> Result<(), String> {
-    let mut failed = 0usize;
-    let mut err_lines: Vec<String> = Vec::new();
-
-    for task in tasks {
-        match task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                failed += 1;
-                remember_error(&mut err_lines, e);
-            }
-            Err(e) => {
-                failed += 1;
-                progress.inc_failed();
-                remember_error(&mut err_lines, format!("task panicked: {e}"));
-            }
+    for &(fi, off) in locs {
+        let target = &files[fi];
+        let Some(file) = target.file.as_ref() else {
+            return Err(format!(
+                "internal: no writable output for {} at offset {off}",
+                target.path
+            ));
+        };
+        let len = (data.len() as u64).min(target.size.saturating_sub(off));
+        if let Err(e) = crate::utils::fs::write_at(file, &data[..len as usize], off) {
+            return Err(format!("write block {hex} at {off}: {e}"));
         }
     }
+    Ok(())
+}
 
-    for e in err_lines {
-        error!("{e}");
-    }
-
-    if failed == 0 {
-        Ok(())
-    } else {
-        Err(format!("{failed} block(s) failed — dest is incomplete"))
+fn record_task(
+    res: Result<Result<(), String>, tokio::task::JoinError>,
+    progress: &FetchProgress,
+    failed: &mut usize,
+    err_lines: &mut Vec<String>,
+) {
+    match res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            *failed += 1;
+            remember_error(err_lines, e);
+        }
+        Err(e) => {
+            *failed += 1;
+            progress.inc_failed();
+            remember_error(err_lines, format!("task panicked: {e}"));
+        }
     }
 }
 
@@ -302,7 +352,9 @@ fn remember_error(lines: &mut Vec<String>, e: String) {
 
 fn sync_outputs(files: &[OutputFile]) -> Result<(), String> {
     for f in files {
-        utils::fs::sync(&f.file).map_err(|e| format!("fsync {}: {e}", f.path))?;
+        if let Some(file) = f.file.as_ref() {
+            utils::fs::sync(file).map_err(|e| format!("fsync {}: {e}", f.path))?;
+        }
     }
     Ok(())
 }
@@ -400,6 +452,7 @@ fn decode_error(e: ManifestError) -> String {
 #[derive(Debug)]
 struct Preflight {
     verified: Vec<Vec<bool>>,
+    needs_write: Vec<bool>,
     conflicts: Vec<PathBuf>,
 }
 
@@ -422,6 +475,7 @@ fn preflight_dest(dest: &Path, manifest: &Manifest, force: bool) -> Result<Prefl
             .iter()
             .map(|f| vec![false; f.chunks.len()])
             .collect(),
+        needs_write: vec![false; manifest.files.len()],
         conflicts: Vec::new(),
     };
 
@@ -429,7 +483,10 @@ fn preflight_dest(dest: &Path, manifest: &Manifest, force: bool) -> Result<Prefl
         let abs = dest.join(&f.path);
         let meta = match std::fs::symlink_metadata(&abs) {
             Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                preflight.needs_write[fi] = true;
+                continue;
+            }
             Err(e) => return Err(format!("stat {}: {e}", abs.display())),
         };
         if !meta.file_type().is_file() {
@@ -454,6 +511,7 @@ fn preflight_dest(dest: &Path, manifest: &Manifest, force: bool) -> Result<Prefl
             }
         }
         if !all_match {
+            preflight.needs_write[fi] = true;
             preflight.conflicts.push(abs);
         }
     }
@@ -762,8 +820,8 @@ mod tests {
         assert_eq!(targets[&second], vec![(0, 4096)]);
     }
 
-    #[tokio::test]
-    async fn create_outputs_makes_nested_dirs_and_preallocates() {
+    #[test]
+    fn create_outputs_makes_nested_dirs_and_preallocates() {
         let dir = std::env::temp_dir().join(format!("rh-create-outputs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let manifest = Manifest {
@@ -779,9 +837,7 @@ mod tests {
             }],
         };
 
-        let files = create_outputs(&dir, &manifest)
-            .await
-            .expect("create outputs");
+        let files = create_outputs(&dir, &manifest, &[true]).expect("create outputs");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "nested/a.txt");
         assert_eq!(files[0].size, 12);
@@ -791,6 +847,22 @@ mod tests {
                 .len(),
             12
         );
+
+        drop(files);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_outputs_skips_files_that_need_no_write() {
+        let dir = temp_dir("skip-output");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        let manifest = one_block_manifest(b"hello");
+
+        let files = create_outputs(&dir, &manifest, &[false]).expect("create outputs");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].file.is_none());
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"hello");
 
         drop(files);
         std::fs::remove_dir_all(&dir).ok();
@@ -834,6 +906,7 @@ mod tests {
         assert!(dir.is_dir());
         assert!(preflight.conflicts.is_empty());
         assert!(!preflight.verified[0][0]);
+        assert!(preflight.needs_write[0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -871,6 +944,7 @@ mod tests {
         let preflight = preflight_dest(&dir, &manifest, false).expect("preflight");
         assert!(preflight.conflicts.is_empty());
         assert!(preflight.verified[0][0]);
+        assert!(!preflight.needs_write[0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

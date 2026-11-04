@@ -62,7 +62,7 @@ impl Command {
                 })
                 .await
             }
-            Command::Check => run_check(),
+            Command::Check => run_check().await,
         }
     }
 }
@@ -99,7 +99,14 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
     info!("{}", stats.summary());
 
     let token: Option<String> = opts.secure.then(generate_token);
-    let shared: Arc<Shared> = build_shared(&manifest, &opts.path, token.clone())?;
+
+    let shared: Arc<Shared> = {
+        let path = opts.path.clone();
+        let token = token.clone();
+        tokio::task::spawn_blocking(move || build_shared(&manifest, &path, token))
+            .await
+            .map_err(|e| format!("build share: {e}"))??
+    };
 
     info!(
         "manifest size {}\n",
@@ -116,11 +123,21 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
         tunnel::start(port).await
     };
     let wan_url = wan.as_ref().map(|t| t.url.as_str());
-    let code = if opts.local {
-        None
-    } else {
-        edge::remember_code(&opts.edge, wan_url, &opts.path).await
-    };
+
+    let (_, code) = tokio::join!(
+        async {
+            if let Some(t) = wan.as_ref() {
+                t.wait_until_live().await;
+            }
+        },
+        async {
+            if opts.local {
+                None
+            } else {
+                edge::remember_code(&opts.edge, wan_url, &opts.path).await
+            }
+        }
+    );
 
     print_serve_details(&lan_url, wan_url, code.as_deref(), token.as_deref());
 
@@ -176,8 +193,11 @@ async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
     }
 }
 
-fn run_check() -> Result<(), String> {
-    print_cloudflared_status(&cloudflared::status());
+async fn run_check() -> Result<(), String> {
+    let status = tokio::task::spawn_blocking(cloudflared::status)
+        .await
+        .map_err(|e| format!("cloudflared check: {e}"))?;
+    print_cloudflared_status(&status);
     Ok(())
 }
 
