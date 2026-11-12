@@ -13,6 +13,7 @@ use std::{
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{
+    debug,
     services::cloudflared,
     utils::{self, dns::DynamicDnsState, tty::Dots},
     warn,
@@ -117,6 +118,7 @@ pub async fn start(port: u16) -> Option<Tunnel> {
         Ok(t) => {
             t.watch_exit();
             status.finish();
+            debug!("tunnel: started at {}", t.url);
             Some(t)
         }
         Err(SpawnError::NotInstalled(e)) => {
@@ -227,7 +229,13 @@ async fn probe_client(host: &str) -> Option<reqwest::Client> {
     if host.ends_with(".trycloudflare.com") {
         let state: DynamicDnsState = utils::dns::resolve_all_doh(host).await;
         if !state.addrs.is_empty() {
+            debug!(
+                "tunnel dns: resolved {host} to {} addr(s) via DoH",
+                state.addrs.len()
+            );
             builder = builder.resolve_to_addrs(host, &state.addrs);
+        } else {
+            debug!("tunnel dns: no DoH results for {host}");
         }
     }
     builder.build().ok()

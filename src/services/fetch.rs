@@ -11,7 +11,7 @@ use std::{
 use reqwest::Client;
 
 use crate::{
-    error, info,
+    debug, info,
     protocol::{
         self,
         manifest::{
@@ -65,7 +65,8 @@ pub async fn fetch(
             Ok::<_, String>((files, targets))
         })
         .await
-        .map_err(|e| format!("prepare destination: {e}"))??
+        .map_err(|e| format!("prepare: task panicked: {e}"))
+        .and_then(|r| r)?
     };
     let files: Arc<Vec<OutputFile>> = Arc::new(files);
 
@@ -101,7 +102,8 @@ pub async fn fetch(
             restore_metadata(&dest, &manifest)
         })
         .await
-        .map_err(|e| format!("finalize output: {e}"))??;
+        .map_err(|e| format!("finalize: task panicked: {e}"))
+        .and_then(|r| r.map_err(|e| format!("finalize: {e}")))?;
     }
 
     Ok(FetchStats {
@@ -117,10 +119,18 @@ async fn build_client(base: &str, timeout: u32) -> Result<Client, String> {
     if let Some(host) = tunnel_host(base) {
         let state: DynamicDnsState = utils::dns::resolve_all_doh(host).await;
         if !state.addrs.is_empty() {
+            debug!(
+                "dns: resolved {host} to {} addr(s) via DoH",
+                state.addrs.len()
+            );
             builder = builder.resolve_to_addrs(host, &state.addrs);
+        } else {
+            debug!("dns: no DoH results for {host}, using system resolver");
         }
     }
-    builder.build().map_err(|e| format!("http client: {e}"))
+    builder
+        .build()
+        .map_err(|e| format!("http client (timeout {}ms): {e}", timeout))
 }
 
 fn tunnel_host(base: &str) -> Option<&str> {
@@ -223,6 +233,7 @@ impl Fetcher {
     }
 
     async fn run(self, targets: BlockTargets) -> Result<(), String> {
+        let total = targets.len();
         let mut set = tokio::task::JoinSet::new();
         let mut failed = 0usize;
         let mut err_lines: Vec<String> = Vec::new();
@@ -242,14 +253,20 @@ impl Fetcher {
             record_task(res, &self.progress, &mut failed, &mut err_lines);
         }
 
-        for e in err_lines {
-            error!("{e}");
-        }
-
         if failed == 0 {
             Ok(())
         } else {
-            Err(format!("{failed} block(s) failed — dest is incomplete"))
+            let hidden = failed.saturating_sub(err_lines.len());
+            let mut msg = format!("{failed}/{total} block(s) failed — dest is incomplete");
+            for e in &err_lines {
+                msg.push_str(&format!("\n  {e}"));
+            }
+            if hidden > 0 {
+                msg.push_str(&format!(
+                    "\n  (and {hidden} more — rerun with --verbose for details)"
+                ));
+            }
+            Err(msg)
         }
     }
 
@@ -263,9 +280,11 @@ impl Fetcher {
 
     async fn try_download(&self, digest: [u8; 32], locs: &[(usize, u64)]) -> Result<(), String> {
         let hex: String = hex_encode(&digest);
+        let short = &hex[..12]; // first 12 hex chars (48 bits) for user-facing messages
         let mut last_err = String::new();
 
         for attempt in 1..=(1 + RETRIES) {
+            debug!("block {hex}: attempt {attempt}/{}", 1 + RETRIES);
             match fetch_block(
                 &self.client,
                 &self.base,
@@ -284,7 +303,7 @@ impl Fetcher {
                         write_block(&files, &data, &locs, &write_hex)
                     })
                     .await
-                    .map_err(|e| format!("block {hex}: write task: {e}"))??;
+                    .map_err(|e| format!("block {short}…: write task: {e}"))??;
                     self.progress.add_bytes(data_len);
                     self.progress.inc_blocks();
                     return Ok(());
@@ -293,11 +312,16 @@ impl Fetcher {
                     last_err = e;
                     break;
                 }
-                Err(BlockError::Retryable(e)) => last_err = e,
+                Err(BlockError::Retryable(e)) => {
+                    debug!("block {hex}: retryable: {e}");
+                    last_err = e;
+                }
             }
             if attempt <= RETRIES {
                 self.progress.inc_retries();
-                tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+                let delay = attempt as u64;
+                debug!("block {hex}: retry in {delay}s");
+                tokio::time::sleep(Duration::from_secs(delay)).await;
             }
         }
 
@@ -313,6 +337,7 @@ fn write_block(
     locs: &[(usize, u64)],
     hex: &str,
 ) -> Result<(), String> {
+    let short = &hex[..12.min(hex.len())];
     for &(fi, off) in locs {
         let target: &OutputFile = &files[fi];
         let Some(file) = target.file.as_ref() else {
@@ -323,7 +348,10 @@ fn write_block(
         };
         let len = (data.len() as u64).min(target.size.saturating_sub(off));
         if let Err(e) = utils::fs::write_at(file, &data[..len as usize], off) {
-            return Err(format!("write block {hex} at {off}: {e}"));
+            return Err(format!(
+                "block {short}…: write at {off} in {}: {e}",
+                target.path
+            ));
         }
     }
     Ok(())
@@ -404,6 +432,7 @@ pub async fn pull_manifest(
 ) -> Result<(Manifest, u64), String> {
     let mut last_err = String::new();
     for attempt in 1..=(1 + RETRIES) {
+        debug!("manifest: attempt {attempt}/{} from {base}", 1 + RETRIES);
         let mut req: reqwest::RequestBuilder = client.get(format!("{base}/__rh__/manifest"));
         if let Some(t) = token {
             req = req.header("Authorization", format!("Bearer {t}"));
@@ -425,19 +454,28 @@ pub async fn pull_manifest(
                 }
                 // 401 UNAUTHORIZED
                 s if s.as_u16() == 401 => {
-                    return Err("manifest: 401 — wrong or missing --token".into());
+                    return Err(
+                        "manifest: 401 — wrong or missing bearer token (pass --bearer <token>)"
+                            .into(),
+                    );
                 }
                 // OTHERS
-                s => last_err = format!("manifest: edge returned {s}"),
+                s => {
+                    debug!("manifest: HTTP {s}");
+                    last_err = format!("manifest: HTTP {s}");
+                }
             },
-            Err(e) => last_err = format!("manifest: {e}"),
+            Err(e) => {
+                debug!("manifest: send failed: {e}");
+                last_err = format!("manifest: {e}");
+            }
         }
         if attempt <= RETRIES {
-            error!(
+            warn!(
                 "manifest: not reachable (attempt {attempt}/{}), retrying...",
                 RETRIES + 1
             );
-            // manifest retries use 'attemp * 5' delays (5s/10s/15s)
+            // manifest retries use 'attempt * 5' delays (5s/10s/15s)
             tokio::time::sleep(Duration::from_secs(5 * attempt as u64)).await;
         }
     }
@@ -541,6 +579,18 @@ fn preflight_dest(dest: &Path, manifest: &Manifest, force: bool) -> Result<Prefl
         return Err(msg);
     }
 
+    let needs = preflight.needs_write.iter().filter(|&&b| b).count();
+    let skipped = manifest.files.len() - needs;
+    let verified_blocks: usize = preflight
+        .verified
+        .iter()
+        .flat_map(|v| v.iter())
+        .filter(|&&b| b)
+        .count();
+    debug!(
+        "preflight: {needs} file(s) to write, {skipped} already match, {verified_blocks} block(s) verified"
+    );
+
     Ok(preflight)
 }
 
@@ -569,6 +619,7 @@ async fn fetch_block(
     hex: &str,
     digest: &[u8; 32],
 ) -> Result<Vec<u8>, BlockError> {
+    let short = &hex[..12.min(hex.len())];
     let mut req = client.get(format!("{base}/__rh__/block/{hex}"));
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {t}"));
@@ -577,26 +628,29 @@ async fn fetch_block(
     let res = req
         .send()
         .await
-        .map_err(|e| BlockError::Retryable(format!("block {hex}: {e}")))?;
-    match res.status() {
+        .map_err(|e| BlockError::Retryable(format!("block {short}…: {e}")))?;
+    let status = res.status();
+    debug!("block {hex}: HTTP {status}");
+    match status {
         s if s.is_success() => {
-            let data = res
-                .bytes()
-                .await
-                .map(|b| b.to_vec())
-                .map_err(|e| BlockError::Retryable(format!("block {hex}: read body: {e}")))?;
+            let data =
+                res.bytes().await.map(|b| b.to_vec()).map_err(|e| {
+                    BlockError::Retryable(format!("block {short}…: read body: {e}"))
+                })?;
             if blake3::hash(&data).as_bytes() != digest {
-                return Err(BlockError::Retryable(format!("block {hex}: hash mismatch")));
+                return Err(BlockError::Retryable(format!(
+                    "block {short}…: hash mismatch"
+                )));
             }
             Ok(data)
         }
         s if s.as_u16() == 401 => Err(BlockError::Fatal(format!(
-            "block {hex}: 401 — wrong --token"
+            "block {short}…: 401 — wrong or missing bearer token (pass --bearer <token>)"
         ))),
-        s if s.as_u16() == 404 => Err(BlockError::Fatal(format!("block {hex}: unknown to sender"))),
-        s => Err(BlockError::Retryable(format!(
-            "block {hex}: edge returned {s}"
+        s if s.as_u16() == 404 => Err(BlockError::Fatal(format!(
+            "block {short}…: not found on sender (sender may have stopped)"
         ))),
+        s => Err(BlockError::Retryable(format!("block {short}…: HTTP {s}"))),
     }
 }
 

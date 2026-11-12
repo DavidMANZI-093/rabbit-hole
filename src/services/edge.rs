@@ -10,13 +10,15 @@ use std::{
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
+use crate::{debug, warn};
+
 pub const DEFUALT_TTL_SECS: u16 = 4 * 3600; // 14,400 seconds — 4 hours
 pub const ROLL_ATTEMPTS: u8 = 8;
 pub const CODE_LEN: u8 = 6;
 
-// The edge base URL baked in at compile time via `build.rs` + `RH_EDGE_BASE` env var.
-// Empty string when built without the env var set (dev builds); causes a runtime error
-// only if a short code is passed to `rh fetch` without an explicit `--edge` override.
+// edge base URL injected at compile time via 'build.rs' + 'RH_EDGE_BASE' env var.
+// Ommittion causes a runtime error only if a short code is passed to 'rh fetch'
+// without an explicit '--edge' override.
 pub const COMPILED_EDGE_BASE: &str = env!("RH_EDGE_BASE");
 
 pub enum EdgeError {
@@ -123,11 +125,16 @@ impl EdgeClient {
             .map(|s| s.trim().to_string())
             .filter(|s| validate_code(s).is_ok());
 
+        if let Some(ref code) = want {
+            debug!("edge: trying remembered code {code:?}");
+        }
+
         let mut attempts = 0u8;
         let mut candidate = want;
         loop {
             match self.claim(url, candidate.as_deref(), ttl).await {
                 Ok(code) => {
+                    debug!("edge: claimed code {code:?} after {attempts} collision(s)");
                     if let Some(parent) = memory.parent() {
                         tokio::fs::create_dir_all(parent).await.ok();
                     }
@@ -136,6 +143,7 @@ impl EdgeClient {
                 }
                 Err(EdgeError::Taken) => {
                     attempts += 1;
+                    debug!("edge: code collision #{attempts}, rolling new candidate");
                     if attempts >= ROLL_ATTEMPTS {
                         return Err(EdgeError::Other(format!(
                             "edge: {ROLL_ATTEMPTS} collisions in a row; try again later"
@@ -221,7 +229,7 @@ pub async fn try_claim_remembered(
     match client.claim_remembered(url, ttl, memory).await {
         Ok(code) => Some(code),
         Err(e) => {
-            crate::warn!("edge claim failed ({e}) — sharing direct link");
+            warn!("edge claim failed ({e}) — sharing direct link");
             None
         }
     }
@@ -244,7 +252,7 @@ pub async fn remember_code(
 // Best-effort release — warns on failure, never panics.
 pub async fn try_release(client: &EdgeClient, code: &str) {
     if let Err(e) = client.release(code).await {
-        crate::warn!("edge release failed ({e})");
+        warn!("edge release failed ({e})");
     }
 }
 

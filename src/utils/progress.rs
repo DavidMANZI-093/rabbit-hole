@@ -9,7 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::utils::format::{format_bytes, truncate_path};
+use crate::utils::{
+    self,
+    format::{format_bytes, truncate_path},
+};
 
 // ---------- Serve/Ingest ----------
 
@@ -41,7 +44,7 @@ impl IngestProgress {
     pub fn new(source: &std::path::Path) -> Self {
         Self::build(
             truncate_path(&source.display().to_string()).into_owned(),
-            !crate::utils::tty::is_tty(),
+            !utils::tty::is_tty(),
         )
     }
 

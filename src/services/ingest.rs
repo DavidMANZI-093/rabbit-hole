@@ -387,6 +387,7 @@ mod tests {
         let mut stats = IngestStats::default();
         let h = make_hash(42);
         push_block(&h, &mut pool, &mut index, &mut chunks, &mut stats);
+        push_block(&h, &mut pool, &mut index, &mut chunks, &mut stats);
         assert_eq!(pool.len(), 1, "pool must not grow on duplicate");
         assert_eq!(chunks, [0u32, 0u32], "both chunks reference same pool slot");
         assert_eq!(stats.blocks_total, 2);

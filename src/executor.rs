@@ -32,16 +32,15 @@ impl Command {
                 secure,
                 edge,
                 local,
-            } => {
-                run_serve(ServeOpts {
-                    path,
-                    block_size,
-                    secure,
-                    local,
-                    edge,
-                })
-                .await
-            }
+            } => run_serve(ServeOpts {
+                path,
+                block_size,
+                secure,
+                local,
+                edge,
+            })
+            .await
+            .map_err(|e| format!("serve: {e}")),
             Command::Fetch {
                 code_or_url,
                 dest,
@@ -50,18 +49,17 @@ impl Command {
                 force,
                 concurrency,
                 edge,
-            } => {
-                run_fetch(FetchOpts {
-                    code_or_url,
-                    dest,
-                    timeout,
-                    bearer,
-                    force,
-                    concurrency,
-                    edge,
-                })
-                .await
-            }
+            } => run_fetch(FetchOpts {
+                code_or_url,
+                dest,
+                timeout,
+                bearer,
+                force,
+                concurrency,
+                edge,
+            })
+            .await
+            .map_err(|e| format!("fetch: {e}")),
             Command::Check => run_check().await,
         }
     }
@@ -87,7 +85,8 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
             ingest(&path, block_size, &progress).map_err(|e| e.to_string())
         })
         .await
-        .map_err(|e| e.to_string())??
+        .map_err(|e| format!("ingest: task panicked: {e}"))
+        .and_then(|r| r.map_err(|e| format!("ingest: {e}")))?
     };
     progress.finish_and_clear();
     if stats.skipped > 0 {
@@ -104,7 +103,8 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
         let token = token.clone();
         tokio::task::spawn_blocking(move || build_shared(&manifest, &path, token))
             .await
-            .map_err(|e| format!("build share: {e}"))??
+            .map_err(|e| format!("build share: task panicked: {e}"))
+            .and_then(|r| r.map_err(|e| format!("build share: {e}")))?
     };
     info!(
         "manifest size {}\n",
