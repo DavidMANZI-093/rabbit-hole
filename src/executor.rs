@@ -13,7 +13,7 @@ use crate::{
         ingest::ingest,
         serve::Server,
         share::{Shared, build_shared, generate_token},
-        tunnel,
+        tunnel::{self, Tunnel},
     },
     utils::{
         format::format_bytes,
@@ -79,17 +79,17 @@ struct ServeOpts {
 
 async fn run_serve(opts: ServeOpts) -> Result<(), String> {
     let progress = IngestProgress::new(&opts.path);
-    let task_progress = progress.clone();
-    let task_path = opts.path.clone();
-    let block_size = opts.block_size;
-
-    let (manifest, stats) = tokio::task::spawn_blocking(move || {
-        ingest(&task_path, block_size, &task_progress).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let (manifest, stats) = {
+        let progress = progress.clone();
+        let path = opts.path.clone();
+        let block_size = opts.block_size;
+        tokio::task::spawn_blocking(move || {
+            ingest(&path, block_size, &progress).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??
+    };
     progress.finish_and_clear();
-
     if stats.skipped > 0 {
         warn!(
             "skipped {} entries, rerun with '--verbose' for reasons",
@@ -99,7 +99,6 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
     info!("{}", stats.summary());
 
     let token: Option<String> = opts.secure.then(generate_token);
-
     let shared: Arc<Shared> = {
         let path = opts.path.clone();
         let token = token.clone();
@@ -107,23 +106,23 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
             .await
             .map_err(|e| format!("build share: {e}"))??
     };
-
     info!(
         "manifest size {}\n",
         format_bytes(shared.manifest_bytes.len() as u64)
     );
 
     let server = Server::bind(shared).await?;
-    let port = server.port();
-    let lan_url: String = format!("http://{}:{port}", lan_ip());
-
-    let wan = if opts.local {
+    let port: u16 = server.port;
+    let lan_url: String = format!("http://{}:{}", lan_ip(), port);
+    let wan: Option<Tunnel> = if opts.local {
         None
     } else {
         tunnel::start(port).await
     };
-    let wan_url = wan.as_ref().map(|t| t.url.as_str());
+    let wan_url: Option<&str> = wan.as_ref().map(|t| t.url.as_str());
 
+    // 'code': edge short code as an 'Option<String>'
+    // (Concurrently waits on tunnel resolution and edge code creation futures)
     let (_, code) = tokio::join!(
         async {
             if let Some(t) = wan.as_ref() {
@@ -138,7 +137,6 @@ async fn run_serve(opts: ServeOpts) -> Result<(), String> {
             }
         }
     );
-
     print_serve_details(&lan_url, wan_url, code.as_deref(), token.as_deref());
 
     if let Err(e) = server.run_until_shutdown().await {

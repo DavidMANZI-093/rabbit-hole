@@ -12,98 +12,21 @@ use std::{
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::{utils::tty::Dots, warn};
+use crate::{
+    services::cloudflared,
+    utils::{self, dns::DynamicDnsState, tty::Dots},
+    warn,
+};
 
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(45);
 const DNS_REFRESH: Duration = Duration::from_secs(10);
 
-// Why a tunnel never materialized. Typed so callers blame accurately
-// instead of printing one misleading message for every failure.
-#[derive(Debug)]
-enum SpawnError {
-    NotInstalled(String),
-    NoTunnelUrl(String),
-}
-
-pub async fn start(port: u16) -> Option<Tunnel> {
-    let status = Dots::start("requesting tunnel");
-    match spawn(port).await {
-        Ok(t) => {
-            t.watch_exit();
-            status.finish();
-            Some(t)
-        }
-        Err(SpawnError::NotInstalled(e)) => {
-            status.finish();
-            warn!("cloudflared not found ({e}) — LAN only (run: rh check)");
-            None
-        }
-        Err(SpawnError::NoTunnelUrl(e)) => {
-            status.finish();
-            warn!("no tunnel URL ({e}) — LAN only (check your internet connection)");
-            None
-        }
-    }
-}
-
-async fn spawn(port: u16) -> Result<Tunnel, SpawnError> {
-    if !crate::utils::net::has_internet().await {
-        return Err(SpawnError::NoTunnelUrl(
-            "no internet route to Cloudflare (1.1.1.1:443 unreachable)".to_string(),
-        ));
-    }
-
-    let origin = format!("http://127.0.0.1:{port}");
-
-    let mut child = super::cloudflared::command(&origin)
-        .await
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| SpawnError::NotInstalled(format!("spawning cloudflared: {e}")))?;
-
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| SpawnError::NotInstalled("cloudflared stderr not piped".to_string()))?;
-    let mut lines = BufReader::new(stderr).lines();
-
-    // Phase 1: wait for subdomain assignment (~5s API round-trip to trycloudflare.com)
-    let url = tokio::time::timeout(START_TIMEOUT, async {
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|e| SpawnError::NoTunnelUrl(format!("reading cloudflared stderr: {e}")))?
-        {
-            if let Some(u) = sniff_url(&line) {
-                return Ok::<String, SpawnError>(u);
-            }
-        }
-        Err(SpawnError::NoTunnelUrl(
-            "cloudflared exited before printing a tunnel URL".to_string(),
-        ))
-    })
-    .await
-    .map_err(|_| {
-        SpawnError::NoTunnelUrl("timed out waiting for cloudflared URL (60s)".to_string())
-    })??;
-
-    tokio::spawn(async move { while lines.next_line().await.ok().flatten().is_some() {} });
-
-    Ok(Tunnel {
-        child: Arc::new(tokio::sync::Mutex::new(child)),
-        dismissed: Arc::new(AtomicBool::new(false)),
-        url,
-    })
-}
-
 pub struct Tunnel {
     child: Arc<tokio::sync::Mutex<tokio::process::Child>>,
     dismissed: Arc<AtomicBool>,
     pub url: String,
+    host: String,
 }
 
 impl Tunnel {
@@ -118,28 +41,20 @@ impl Tunnel {
 
     pub async fn wait_until_live(&self) -> bool {
         let status = Dots::start("resolving dns");
-        let live = self.probe_until_live().await;
+        let live: bool = self.probe_until_live().await;
         status.finish();
         if !live {
-            warn!("tunnel URL not yet reachable at edge — sharing anyway");
+            warn!("tunnel URL not resolvable yet, sharing anyway");
         }
         live
     }
 
     async fn probe_until_live(&self) -> bool {
         let probe = format!("{}/__rh__/health", self.url);
-        let host = self
-            .url
-            .strip_prefix("https://")
-            .or_else(|| self.url.strip_prefix("http://"))
-            .unwrap_or(&self.url)
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let host = self.host.as_str();
 
         let start = tokio::time::Instant::now();
-        let mut client = probe_client(&host).await;
+        let mut client: Option<reqwest::Client> = probe_client(host).await;
         let mut refresh_at = tokio::time::Instant::now() + DNS_REFRESH;
 
         while start.elapsed() < LIVE_TIMEOUT {
@@ -153,7 +68,7 @@ impl Tunnel {
 
             let now = tokio::time::Instant::now();
             if now >= refresh_at {
-                client = probe_client(&host).await;
+                client = probe_client(host).await;
                 refresh_at = now + DNS_REFRESH;
             }
 
@@ -172,6 +87,7 @@ impl Tunnel {
                 if dismissed.load(Ordering::SeqCst) {
                     return;
                 }
+
                 let mut c = child.lock().await;
                 match c.try_wait() {
                     Ok(Some(status)) => {
@@ -189,10 +105,127 @@ impl Tunnel {
     }
 }
 
+#[derive(Debug)]
+enum SpawnError {
+    NotInstalled(String),
+    NoTunnelUrl(String),
+}
+
+pub async fn start(port: u16) -> Option<Tunnel> {
+    let status = Dots::start("requesting tunnel");
+    match spawn(port).await {
+        Ok(t) => {
+            t.watch_exit();
+            status.finish();
+            Some(t)
+        }
+        Err(SpawnError::NotInstalled(e)) => {
+            status.finish();
+            warn!("cloudflared not found. LAN only (run: rh check). {}", e);
+            None
+        }
+        Err(SpawnError::NoTunnelUrl(e)) => {
+            status.finish();
+            warn!(
+                "no tunnel URL. LAN only (check your internet connection). {}",
+                e
+            );
+            None
+        }
+    }
+}
+
+async fn spawn(port: u16) -> Result<Tunnel, SpawnError> {
+    if !utils::net::has_internet().await {
+        return Err(SpawnError::NoTunnelUrl(
+            "no internet connection. (1.1.1.1:443 unreachable)".to_string(),
+        ));
+    }
+
+    let origin = format!("http://127.0.0.1:{port}");
+    let mut child = cloudflared::command(&origin)
+        .await
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| SpawnError::NotInstalled(format!("spawning cloudflared: {}", e)))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| SpawnError::NotInstalled("cloudflared stderr not piped".to_string()))?;
+    let mut lines = BufReader::new(stderr).lines();
+
+    let sniffed: SniffedUrl = tokio::time::timeout(START_TIMEOUT, async {
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| SpawnError::NoTunnelUrl(format!("reading cloudflared stderr: {e}")))?
+        {
+            if let Some(u) = sniff_url(&line) {
+                return Ok::<SniffedUrl, SpawnError>(u);
+            }
+        }
+        Err(SpawnError::NoTunnelUrl(
+            "cloudflared exited before printing a tunnel URL".to_string(),
+        ))
+    })
+    .await
+    .map_err(|_| {
+        SpawnError::NoTunnelUrl(format!(
+            "timed out waiting for cloudflared URL ({})",
+            START_TIMEOUT.as_secs()
+        ))
+    })??;
+
+    // Gracefully exaust stderr pipe
+    tokio::spawn(async move { while lines.next_line().await.ok().flatten().is_some() {} });
+
+    Ok(Tunnel {
+        child: Arc::new(tokio::sync::Mutex::new(child)),
+        dismissed: Arc::new(AtomicBool::new(false)),
+        url: sniffed.url,
+        host: sniffed.host,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SniffedUrl {
+    url: String,
+    host: String,
+}
+
+fn sniff_url(line: &str) -> Option<SniffedUrl> {
+    // start: "https://"
+    let start: usize = line.find("https://")?;
+    let rest: &str = &line[start..];
+
+    // end: index of first probable 'url' termination indicator: ", ', or )
+    let end: usize = rest
+        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')')
+        .unwrap_or(rest.len());
+    let cand: &str = &rest[..end];
+    let host: &str = cand.strip_prefix("https://")?;
+
+    // return 'cand' & 'host' if ends with ".trycloudflare.com", is-not pointing elsewhere (contains '/').
+    // Otherwise, 'None'.
+    if host.ends_with(".trycloudflare.com") && !host.contains('/') && !host.is_empty() {
+        let label = host.strip_suffix(".trycloudflare.com").unwrap_or("");
+        if !label.is_empty() {
+            return Some(SniffedUrl {
+                url: cand.to_string(),
+                host: host.to_string(),
+            });
+        }
+    }
+    None
+}
+
 async fn probe_client(host: &str) -> Option<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(3));
     if host.ends_with(".trycloudflare.com") {
-        let state = crate::utils::dns::resolve_all_doh(host).await;
+        let state: DynamicDnsState = utils::dns::resolve_all_doh(host).await;
         if !state.addrs.is_empty() {
             builder = builder.resolve_to_addrs(host, &state.addrs);
         }
@@ -200,50 +233,34 @@ async fn probe_client(host: &str) -> Option<reqwest::Client> {
     builder.build().ok()
 }
 
-fn sniff_url(line: &str) -> Option<String> {
-    let start = line.find("https://")?;
-    let rest = &line[start..];
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')')
-        .unwrap_or(rest.len());
-    let cand = &rest[..end];
-    let host = cand.strip_prefix("https://")?;
-    if host.ends_with(".trycloudflare.com") && !host.contains('/') && !host.is_empty() {
-        let label = host.strip_suffix(".trycloudflare.com").unwrap_or("");
-        if !label.is_empty() {
-            return Some(cand.to_string());
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // --- sniff_url ---
-
     #[test]
     fn extracts_url_from_cloudflared_box_line() {
         let line = "2026-09-22T06:40:14Z INF |  https://auckland-contacting-ensure-enhanced.trycloudflare.com  |";
+        let sniffed = sniff_url(line).expect("sniff url");
         assert_eq!(
-            sniff_url(line),
-            Some("https://auckland-contacting-ensure-enhanced.trycloudflare.com".to_string())
+            sniffed.url,
+            "https://auckland-contacting-ensure-enhanced.trycloudflare.com"
+        );
+        assert_eq!(
+            sniffed.host,
+            "auckland-contacting-ensure-enhanced.trycloudflare.com"
         );
     }
 
     #[test]
     fn extracts_url_from_bare_log_line() {
         let line = "Visit it at https://foo-bar-baz.trycloudflare.com and enjoy";
-        assert_eq!(
-            sniff_url(line),
-            Some("https://foo-bar-baz.trycloudflare.com".to_string())
-        );
+        let sniffed = sniff_url(line).expect("sniff url");
+        assert_eq!(sniffed.url, "https://foo-bar-baz.trycloudflare.com");
+        assert_eq!(sniffed.host, "foo-bar-baz.trycloudflare.com");
     }
 
     #[test]
     fn rejects_http_scheme() {
-        // cloudflared always uses https; plain http must not be accepted
         let line = "http://foo-bar-baz.trycloudflare.com";
         assert_eq!(sniff_url(line), None);
     }
@@ -256,14 +273,12 @@ mod tests {
 
     #[test]
     fn rejects_bare_trycloudflare_domain_without_subdomain() {
-        // "https://trycloudflare.com" has no label before the suffix — must reject
         let line = "https://trycloudflare.com";
         assert_eq!(sniff_url(line), None);
     }
 
     #[test]
     fn rejects_url_with_path() {
-        // cloudflared prints only the hostname, never a path
         let line = "https://foo.trycloudflare.com/some/path";
         assert_eq!(sniff_url(line), None);
     }
@@ -271,9 +286,8 @@ mod tests {
     #[test]
     fn stops_at_whitespace() {
         let line = "https://my-tunnel.trycloudflare.com is now live";
-        assert_eq!(
-            sniff_url(line),
-            Some("https://my-tunnel.trycloudflare.com".to_string())
-        );
+        let sniffed = sniff_url(line).expect("sniff url");
+        assert_eq!(sniffed.url, "https://my-tunnel.trycloudflare.com");
+        assert_eq!(sniffed.host, "my-tunnel.trycloudflare.com");
     }
 }

@@ -3,13 +3,17 @@
 
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use rand::Rng;
 
-use crate::protocol::{self, manifest::Manifest};
+use crate::{
+    protocol::{self, manifest::Manifest},
+    utils,
+};
 
 #[derive(Clone)]
 pub struct Locator {
@@ -37,7 +41,6 @@ pub enum Kind {
 
 pub struct Shared {
     pub manifest_bytes: Vec<u8>,
-    pub etag: String,
     pub kind: Kind,
     pub blocks: HashMap<[u8; 32], Arc<Vec<Locator>>>,
     pub token: Option<String>,
@@ -54,21 +57,19 @@ pub fn build_shared(
     src: &Path,
     token: Option<String>,
 ) -> Result<Arc<Shared>, String> {
-    // Validate before encoding: 'encode()' debug-asserts validity, which
-    // panics in debug builds instead of returning Err on corrupt input.
     manifest
         .validate()
         .map_err(|e| format!("invalid manifest: {e}"))?;
 
-    let manifest_bytes = protocol::manifest::encode(manifest);
-    let etag = blake3::hash(&manifest_bytes).to_hex().to_string();
-    let bs = manifest.block_size as u64;
-    let single = src.is_file();
+    let manifest_bytes: Vec<u8> = protocol::manifest::encode(manifest);
+    let bs: u64 = manifest.block_size as u64;
+    let single: bool = src.is_file();
 
-    let mut blocks_build: HashMap<[u8; 32], Vec<Locator>> = HashMap::new();
-    let root_prefix: Option<String> = manifest.root.clone().map(|r| format!("{r}/"));
+    let mut blocks: HashMap<[u8; 32], Vec<Locator>> = HashMap::new();
+    let root_prefix: Option<String> = manifest.root.as_deref().map(|r| format!("{r}/"));
     for f in &manifest.files {
-        let rel = match &root_prefix {
+        let rel: &str = match &root_prefix {
+            // .., and returns 'Err(..)' if file 'f' lacks prefix 'root_prefix'; probable spoof.
             Some(prefix) => f.path.strip_prefix(prefix.as_str()).ok_or_else(|| {
                 format!(
                     "manifest path {} outside root {}",
@@ -78,28 +79,28 @@ pub fn build_shared(
             })?,
             None => f.path.as_str(),
         };
-        let abs = if single {
+        let abs: PathBuf = if single {
             src.to_path_buf()
         } else {
             src.join(rel)
         };
 
-        for (j, idx) in f.chunks.iter().enumerate() {
-            let digest = manifest.pool[*idx as usize];
-            let offset = j as u64 * bs;
-            let len = bs.min(f.size.saturating_sub(offset)) as u32;
+        for (nth, idx) in f.chunks.iter().enumerate() {
+            let digest: [u8; 32] = manifest.pool[*idx as usize];
+            let offset: u64 = bs * nth as u64;
+            let len: u32 = bs.min(f.size.saturating_sub(offset)) as u32;
 
-            blocks_build.entry(digest).or_default().push(Locator {
+            blocks.entry(digest).or_default().push(Locator {
                 abs: abs.clone(),
                 offset,
                 len,
             });
         }
     }
-    let blocks: HashMap<[u8; 32], Arc<Vec<Locator>>> = blocks_build
-        .into_iter()
-        .map(|(k, v)| (k, Arc::new(v)))
-        .collect();
+
+    // Maps 'digest' -> shared 'Locator' list, where 'Locator' spans abs_bytes[offset..offset + len].
+    let blocks: HashMap<[u8; 32], Arc<Vec<Locator>>> =
+        blocks.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
 
     let kind = if single {
         let entry = manifest
@@ -110,9 +111,8 @@ pub fn build_shared(
             return Err("single-file share expects exactly one manifest entry".into());
         }
 
-        let live =
-            crate::utils::fs::metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
-        if live.kind != crate::utils::fs::Kind::File {
+        let live = utils::fs::metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
+        if live.kind != utils::fs::Kind::File {
             return Err(format!("refusing non-file {}", src.display()));
         }
         if live.size != entry.size {
@@ -124,7 +124,7 @@ pub fn build_shared(
 
         let name = src
             .file_name()
-            .and_then(std::ffi::os_str::OsStr::to_str)
+            .and_then(OsStr::to_str)
             .unwrap_or("download")
             .to_string();
         Kind::Single {
@@ -148,7 +148,6 @@ pub fn build_shared(
 
     Ok(Arc::new(Shared {
         manifest_bytes,
-        etag,
         kind,
         blocks,
         token,
@@ -171,10 +170,10 @@ fn read_verified_block(want: &[u8; 32], cands: &[Locator]) -> Result<Vec<u8>, St
             Ok(f) => f,
             Err(_) => continue,
         };
-        let mut buf = vec![0u8; loc.len as usize];
-        let mut off = 0;
+        let mut buf: Vec<u8> = vec![0u8; loc.len as usize];
+        let mut off: usize = 0;
         while off < buf.len() {
-            match crate::utils::fs::read_at(&f, &mut buf[off..], loc.offset + off as u64) {
+            match utils::fs::read_at(&f, &mut buf[off..], loc.offset + off as u64) {
                 Ok(0) => break,
                 Ok(n) => off += n,
                 Err(_) => break,
@@ -193,7 +192,7 @@ fn read_verified_block(want: &[u8; 32], cands: &[Locator]) -> Result<Vec<u8>, St
 pub fn generate_token() -> String {
     let mut buf = [0u8; 32];
     rand::rng().fill_bytes(&mut buf);
-    crate::protocol::manifest::common::hex_encode(&buf)
+    protocol::manifest::common::hex_encode(&buf)
 }
 
 #[cfg(test)]
@@ -266,7 +265,6 @@ mod tests {
     fn read_block_reports_unknown_digest() {
         let shared = Shared {
             manifest_bytes: Vec::new(),
-            etag: String::new(),
             kind: Kind::Dir {
                 root: PathBuf::new(),
                 files: Vec::new(),

@@ -13,7 +13,7 @@ use reqwest::Client;
 use crate::{
     error, info,
     protocol::manifest::{
-        self, CURRENT, Manifest,
+        CURRENT, Manifest,
         common::{ManifestError, hex_encode},
         v1::MAGIC,
     },

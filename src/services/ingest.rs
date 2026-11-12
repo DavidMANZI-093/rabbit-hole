@@ -285,34 +285,34 @@ fn hash_file_inner(
             File::open(abs).map_err(|e| IngestError::Fs(fs::map_io(abs, fs::Op::Read, e)))?;
         let mut buffer = vec![0u8; READ_BUF_SIZE];
         let mut hasher = blake3::Hasher::new();
-        let mut in_block: u64 = 0;
+        let mut packed_bytes: u64 = 0;
 
         loop {
-            let n = f
+            let bytes_in_file: usize = f
                 .read(&mut buffer)
                 .map_err(|e| IngestError::Fs(fs::map_io(abs, Op::Read, e)))?;
-            if n == 0 {
+            if bytes_in_file == 0 {
                 break;
             }
-            stats.bytes += n as u64;
-            progress.add_bytes(n as u64);
+            stats.bytes += bytes_in_file as u64;
+            progress.add_bytes(bytes_in_file as u64);
 
-            let mut offset = 0;
-            while offset < n {
-                let want = (bs - in_block).min((n - offset) as u64) as usize;
+            let mut offset: usize = 0;
+            while offset < bytes_in_file {
+                let want: usize = (bs - packed_bytes).min((bytes_in_file - offset) as u64) as usize;
                 hasher.update(&buffer[offset..offset + want]);
                 offset += want;
-                in_block += want as u64;
+                packed_bytes += want as u64;
 
-                if in_block == bs {
+                if packed_bytes == bs {
                     push_block(&hasher.finalize(), pool, index, &mut chunks, stats);
                     hasher = blake3::Hasher::new();
-                    in_block = 0;
+                    packed_bytes = 0;
                 }
             }
         }
 
-        if in_block > 0 {
+        if packed_bytes > 0 {
             push_block(&hasher.finalize(), pool, index, &mut chunks, stats);
         }
     }
@@ -334,21 +334,20 @@ fn push_block(
     index: &mut HashMap<[u8; 32], u32>,
     chunks: &mut Vec<u32>,
     stats: &mut IngestStats,
-) -> bool {
-    let bytes = *digest.as_bytes();
-    let (id, unique) = match index.get(&bytes) {
-        Some(&id) => (id, false),
+) {
+    let bytes: [u8; 32] = *digest.as_bytes();
+    let id: u32 = match index.get(&bytes) {
+        Some(&id) => id,
         None => {
-            let id = pool.len() as u32;
+            let id: u32 = pool.len() as u32;
             pool.push(bytes);
             index.insert(bytes, id);
-            (id, true)
+            id
         }
     };
 
     chunks.push(id);
     stats.blocks_total += 1;
-    unique
 }
 
 #[cfg(test)]
@@ -368,14 +367,13 @@ mod tests {
         let mut index = HashMap::new();
         let mut chunks = Vec::new();
         let mut stats = IngestStats::default();
-        let unique = push_block(
+        push_block(
             &make_hash(1),
             &mut pool,
             &mut index,
             &mut chunks,
             &mut stats,
         );
-        assert!(unique);
         assert_eq!(pool.len(), 1);
         assert_eq!(chunks, [0u32]);
         assert_eq!(stats.blocks_total, 1);
@@ -389,8 +387,6 @@ mod tests {
         let mut stats = IngestStats::default();
         let h = make_hash(42);
         push_block(&h, &mut pool, &mut index, &mut chunks, &mut stats);
-        let unique = push_block(&h, &mut pool, &mut index, &mut chunks, &mut stats);
-        assert!(!unique);
         assert_eq!(pool.len(), 1, "pool must not grow on duplicate");
         assert_eq!(chunks, [0u32, 0u32], "both chunks reference same pool slot");
         assert_eq!(stats.blocks_total, 2);

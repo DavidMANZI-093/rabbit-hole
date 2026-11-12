@@ -14,6 +14,7 @@ use axum::{
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 use crate::{
+    protocol,
     services::share::{BlockError, Shared},
     utils::signal::shutdown_signal,
 };
@@ -23,45 +24,41 @@ const GRACE: Duration = Duration::from_secs(5);
 // ---------- lifecycle ----------
 
 pub struct Server {
-    port: u16,
-    stop: Option<oneshot::Sender<()>>,
+    pub port: u16,
+    tx_stop: Option<oneshot::Sender<()>>,
     handle: JoinHandle<io::Result<()>>,
 }
 
 impl Server {
     pub async fn bind(shared: Arc<Shared>) -> Result<Self, String> {
-        let app = router(shared);
+        let app: Router = router(shared);
         let listener = TcpListener::bind(("0.0.0.0", 0u16))
             .await
             .map_err(|e| format!("bind: {e}"))?;
-        let port = listener
+        let port: u16 = listener
             .local_addr()
             .map_err(|e| format!("local addr: {e}"))?
             .port();
 
-        let (stop, stopped) = oneshot::channel::<()>();
+        let (tx_stop, rx_stopped) = oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
-                    stopped.await.ok();
+                    rx_stopped.await.ok();
                 })
                 .await
         });
 
         Ok(Self {
             port,
-            stop: Some(stop),
+            tx_stop: Some(tx_stop),
             handle,
         })
     }
 
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-
-    // Waits for Ctrl-C/SIGTERM or an early server exit, then drains for
-    // `GRACE` and aborts if the server is still running.
     pub async fn run_until_shutdown(mut self) -> Result<(), String> {
+        // 'early': waits for Ctrl-C/SIGTERM or an early server exit and is only 'Some(..)' if not
+        // the intentional 'shutdown_signal()'.
         let early = tokio::select! {
             _ = shutdown_signal() => None,
             r = &mut self.handle => Some(r),
@@ -70,8 +67,9 @@ impl Server {
             return join(r);
         }
 
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
+        // Transmit 'stop' signal
+        if let Some(tx) = self.tx_stop.take() {
+            let _ = tx.send(());
         }
         match tokio::time::timeout(GRACE, &mut self.handle).await {
             Ok(r) => join(r),
@@ -88,6 +86,7 @@ impl Server {
 }
 
 impl Drop for Server {
+    // Invoked when 'Server' instance goes out of scope.
     fn drop(&mut self) {
         self.handle.abort();
     }
@@ -106,13 +105,26 @@ fn join(r: Result<io::Result<()>, tokio::task::JoinError>) -> Result<(), String>
 fn router(shared: Arc<Shared>) -> Router {
     Router::new()
         .route("/__rh__/manifest", get(h_manifest))
-        .route("/__rh__/block/{:hash}", get(h_block))
-        .route("/__rh__/health", get(|| async { "ok" }))
+        .route("/__rh__/block/{hash}", get(h_block))
+        .route("/__rh__/health", get(h_health))
         .with_state(shared)
 }
 
 // ---------- handlers ----------
 
+// --- req ----------------------
+//
+// GET /__rh__/manifest HTTP/1
+// Authorization: Bearer <token>
+//
+// --- res ----------------------
+//
+// HTTP/1 200 OK
+// content-type: application/x-rhbm-v1
+// content-length: <manifest-bytes-length>
+//
+// <binary-manifest-bytes>
+//
 async fn h_manifest(
     State(s): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -124,11 +136,23 @@ async fn h_manifest(
     Response::builder()
         .header(header::CONTENT_TYPE, "application/x-rhbm-v1")
         .header(header::CONTENT_LENGTH, s.manifest_bytes.len().to_string())
-        .header(header::ETAG, format!("\"{}\"", s.etag))
         .body(Body::from(s.manifest_bytes.clone()))
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "build failed\n").into_response())
 }
 
+// --- req ----------------------
+//
+// GET /__rh__/block/<32-byte-hex-hash> HTTP/1
+// Authorization: Bearer <token>
+//
+// --- res ----------------------
+//
+// HTTP/1 200 OK
+// content-type: application/octet-stream
+// content-length: <block-bytes-length>
+//
+// <raw-block-bytes>
+//
 async fn h_block(
     State(s): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -138,7 +162,7 @@ async fn h_block(
     if !bearer_ok(&headers, &q, s.token.as_deref()) {
         return unauthorized();
     }
-    let want = match crate::protocol::manifest::common::hex_decode32(&hash_hex.to_lowercase()) {
+    let want: [u8; 32] = match protocol::manifest::common::hex_decode32(&hash_hex.to_lowercase()) {
         Ok(h) => h,
         Err(_) => return (StatusCode::BAD_REQUEST, "bad block hash\n").into_response(),
     };
@@ -146,7 +170,6 @@ async fn h_block(
         Ok(Ok(bytes)) => Response::builder()
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header(header::CONTENT_LENGTH, bytes.len().to_string())
-            .header(header::ETAG, format!("\"{hash_hex}\""))
             .body(Body::from(bytes))
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "build failed\n").into_response()
@@ -161,19 +184,23 @@ async fn h_block(
     }
 }
 
-// ---------- auth ----------
-
-fn ct_eq(a: &str, b: &str) -> bool {
-    let (x, y) = (a.as_bytes(), b.as_bytes());
-    if x.len() != y.len() {
-        return false;
-    }
-    let mut d = 0u8;
-    for i in 0..x.len() {
-        d |= x[i] ^ y[i];
-    }
-    d == 0
+// --- req ----------------------
+//
+// GET /__rh__/health HTTP/1
+//
+// --- res ----------------------
+//
+// HTTP/1 200 OK
+// content-type: text/plain; charset=utf-8
+// content-length: 2
+//
+// ok
+//
+async fn h_health() -> &'static str {
+    "ok"
 }
+
+// ---------- auth ----------
 
 fn unauthorized() -> Response {
     (
@@ -201,6 +228,18 @@ fn bearer_ok(headers: &HeaderMap, q: &HashMap<String, String>, expected: Option<
         return true;
     }
     false
+}
+
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (x, y) = (a.as_bytes(), b.as_bytes());
+    if x.len() != y.len() {
+        return false;
+    }
+    let mut d = 0u8;
+    for i in 0..x.len() {
+        d |= x[i] ^ y[i];
+    }
+    d == 0
 }
 
 #[cfg(test)]

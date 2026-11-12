@@ -3,6 +3,8 @@
 
 use std::fmt;
 
+use crate::warn;
+
 pub const SOURCE_PAGE: &str = "https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/";
 
 pub const MIN: CalVer = CalVer {
@@ -111,6 +113,11 @@ impl Status {
     }
 }
 
+fn probe() -> Verdict {
+    let output = version_output();
+    classify(output.as_deref().and_then(parse_version))
+}
+
 fn version_output() -> Option<String> {
     let out = std::process::Command::new(binary())
         .arg("--version")
@@ -121,11 +128,6 @@ fn version_output() -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn probe() -> Verdict {
-    let output = version_output();
-    classify(output.as_deref().and_then(parse_version))
-}
-
 pub fn status() -> Status {
     Status::from_output(version_output(), is_bundled())
 }
@@ -133,7 +135,7 @@ pub fn status() -> Status {
 pub async fn command(origin: &str) -> tokio::process::Command {
     let compat = match tokio::task::spawn_blocking(probe).await {
         Ok(Verdict::TooOld(v)) => {
-            crate::warn!("cloudflared version is old, need >= {} (have {v})", MIN);
+            warn!("cloudflared version is old, need >= {} (have {v})", MIN);
             true
         }
         _ => false,
