@@ -23,6 +23,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub cmd: Command,
 
+    /// Disable colored output.
     #[arg(long)]
     pub no_color: bool,
 
@@ -33,33 +34,89 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Serve a file or directory over LAN or a public tunnel.
     Serve {
+        /// File or directory to share.
+        ///
+        /// Directory contents are shared as-is; symlinks are skipped or refused.
         path: PathBuf,
 
+        /// Block size for hashing and transfer (4 KiB..=64 MiB; K/M/G = binary).
+        ///
+        /// Smaller blocks improve deduplication and resume granularity; larger blocks
+        /// reduce request count.
         #[arg(long, short, value_name = "SIZE", default_value = "1MiB", value_parser = parse_block_size)]
         block_size: u32,
+
+        /// Generate and require a bearer token (authentication only).
+        ///
+        /// The token is printed with the serve details. It does not encrypt LAN
+        /// traffic; the public tunnel is HTTPS.
         #[arg(long, short)]
         secure: bool,
-        #[arg(long, short, default_value = COMPILED_EDGE_BASE)]
+
+        /// Override the short-code service URL used to claim a code (advanced).
+        ///
+        /// Normally configured a free default. Only needed for a self-hosted or
+        /// alternate service.
+        #[arg(long, short, value_name = "URL", default_value = COMPILED_EDGE_BASE, hide_default_value = true)]
         edge: String,
+
+        /// Skip the public tunnel and short code; use the direct local URL.
+        ///
+        /// The listener still binds to all interfaces; use a firewall if you need
+        /// interface-level restrictions.
         #[arg(long, short)]
         local: bool,
     },
+
+    /// Fetch a shared file or directory using a short code or direct URL.
     Fetch {
+        /// 6-character hex short code or full HTTP(S) URL.
+        ///
+        /// Short codes are resolved through the configured short-code service;
+        /// direct URLs bypass it.
         code_or_url: String,
+
+        /// Directory to receive files (created if needed).
+        ///
+        /// Existing matching files are reused; conflicting targets abort unless
+        /// --force is passed.
         dest: PathBuf,
 
+        /// Per-request timeout in milliseconds (15000..=120000).
+        ///
+        /// Applies to the manifest and each block request; retry delays are
+        /// additional.
         #[arg(long, short, default_value_t = DEFAULT_TIMEOUT_MS, value_parser = clap::value_parser!(u32).range(MIN_TIMEOUT_MS as i64..=MAX_TIMEOUT_MS as i64))]
         timeout: u32,
+
+        /// Bearer token printed by 'rh serve --secure'.
         #[arg(long, short)]
         bearer: Option<String>,
+
+        /// Allow writing over files that differ from the share.
+        ///
+        /// Only conflicting target files are touched; matching blocks and
+        /// unrelated files are preserved.
         #[arg(long, short)]
         force: bool,
+
+        /// Concurrent block downloads (1..=12).
+        ///
+        /// Defaults to the CPU count capped at 12. Higher values can help
+        /// high-latency links but increase memory and bandwidth pressure.
         #[arg(long, short, default_value_t = thread::available_parallelism().map_or(1, |n| n.get()).min(12) as u8, value_parser = clap::value_parser!(u8).range(1..=MAX_CONCURRENCY as i64))]
         concurrency: u8,
-        #[arg(long, short, default_value = COMPILED_EDGE_BASE)]
+
+        /// Override the short-code service URL used to resolve a code (advanced).
+        ///
+        /// Normally configured at build time. Direct URLs do not need it.
+        #[arg(long, short, value_name = "URL", default_value = COMPILED_EDGE_BASE, hide_default_value = true)]
         edge: String,
     },
+
+    /// Check cloudflared installation and compatibility for public tunneling.
     Check,
 }
 
