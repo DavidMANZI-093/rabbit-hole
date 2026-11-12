@@ -96,7 +96,7 @@ fn parse_block_size(raw: &str) -> Result<u32, String> {
             ));
         }
     };
-    let bytes = n
+    let bytes: u64 = n
         .checked_mul(multiplier)
         .ok_or_else(|| format!("invalid block size {raw:?}: too large"))?;
 

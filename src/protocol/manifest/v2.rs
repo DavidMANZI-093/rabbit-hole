@@ -20,7 +20,7 @@ const KNOWN_FLAGS: u16 = FLAG_UNIX_MODE | FLAG_MTIME;
 pub fn encode(m: &Manifest) -> Vec<u8> {
     debug_assert!(m.validate().is_ok(), "encode called with invalid manifest");
 
-    let mut out = Vec::with_capacity(16 + m.pool.len() * 32);
+    let mut out: Vec<u8> = Vec::with_capacity(16 + m.pool.len() * 32);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     let mut flags = 0u16;
@@ -46,7 +46,7 @@ pub fn encode(m: &Manifest) -> Vec<u8> {
     }
 
     for f in &m.files {
-        let pb = f.path.as_bytes();
+        let pb: &[u8] = f.path.as_bytes();
         encode_uleb(pb.len() as u64, &mut out);
         out.extend_from_slice(pb);
         encode_uleb(f.size, &mut out);
@@ -78,22 +78,22 @@ struct Header {
 
 impl Header {
     fn decode(r: &mut Reader<'_>) -> Result<Self, ManifestError> {
-        let magic = r.array::<4>()?;
+        let magic: [u8; 4] = r.array::<4>()?;
         if magic != MAGIC {
             return Err(ManifestError::BadMagic);
         }
 
-        let version = r.u16_le()?;
+        let version: u16 = r.u16_le()?;
         if version != VERSION {
             return Err(ManifestError::UnsupportedVersion(version));
         }
 
-        let flags = r.u16_le()?;
+        let flags: u16 = r.u16_le()?;
         if flags & !KNOWN_FLAGS != 0 {
             return Err(ManifestError::UnknownFlags(flags));
         }
 
-        let block_size = r.u32_le()?;
+        let block_size: u32 = r.u32_le()?;
         if !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block_size) {
             return Err(ManifestError::BadBlockSize(block_size));
         }
@@ -109,12 +109,12 @@ impl Header {
 }
 
 fn decode_root(r: &mut Reader<'_>) -> Result<Option<String>, ManifestError> {
-    let len = r.uleb_limited(MAX_PATH_LEN as u64)?;
+    let len: u64 = r.uleb_limited(MAX_PATH_LEN as u64)?;
     if len == 0 {
         return Ok(None);
     }
 
-    let root = r.str(len as usize)?;
+    let root: &str = r.str(len as usize)?;
     validate_path(root)?;
     if root.contains('/') {
         return Err(ManifestError::BadPath(
@@ -126,7 +126,7 @@ fn decode_root(r: &mut Reader<'_>) -> Result<Option<String>, ManifestError> {
 }
 
 fn decode_pool(r: &mut Reader<'_>, count: u64) -> Result<Vec<[u8; 32]>, ManifestError> {
-    let mut pool = Vec::with_capacity(capacity(count));
+    let mut pool: Vec<[u8; 32]> = Vec::with_capacity(capacity(count));
     for _ in 0..count {
         pool.push(r.array::<32>()?);
     }
@@ -134,17 +134,17 @@ fn decode_pool(r: &mut Reader<'_>, count: u64) -> Result<Vec<[u8; 32]>, Manifest
 }
 
 fn decode_files<'a>(r: &mut Reader<'a>, header: &Header) -> Result<Vec<FileEntry>, ManifestError> {
-    let mut files = Vec::with_capacity(capacity(header.file_count));
+    let mut files: Vec<FileEntry> = Vec::with_capacity(capacity(header.file_count));
     let mut seen: HashSet<&'a str> = HashSet::with_capacity(files.capacity());
-    let root_prefix = header.root.as_ref().map(|root| format!("{root}/"));
+    let root_prefix: Option<String> = header.root.as_ref().map(|root| format!("{root}/"));
 
     for _ in 0..header.file_count {
-        let len = r.uleb_limited(MAX_PATH_LEN as u64)?;
+        let len: u64 = r.uleb_limited(MAX_PATH_LEN as u64)?;
         if len == 0 {
             return Err(ManifestError::OverLimit(0, MAX_PATH_LEN as u64));
         }
 
-        let path = r.str(len as usize)?;
+        let path: &str = r.str(len as usize)?;
         validate_path(path)?;
         if let Some(prefix) = &root_prefix
             && !path.starts_with(prefix.as_str())
@@ -158,18 +158,18 @@ fn decode_files<'a>(r: &mut Reader<'a>, header: &Header) -> Result<Vec<FileEntry
             return Err(ManifestError::DuplicatePath(path.to_string()));
         }
 
-        let size = r.uleb()?;
-        let mode = if header.flags & FLAG_UNIX_MODE != 0 {
+        let size: u64 = r.uleb()?;
+        let mode: Option<u32> = if header.flags & FLAG_UNIX_MODE != 0 {
             Some(r.u32_le()?)
         } else {
             None
         };
-        let mtime_ns = if header.flags & FLAG_MTIME != 0 {
+        let mtime_ns: Option<i64> = if header.flags & FLAG_MTIME != 0 {
             Some(r.i64_le()?)
         } else {
             None
         };
-        let chunks = decode_chunks(r, size, header.block_size, header.block_count)?;
+        let chunks: Vec<u32> = decode_chunks(r, size, header.block_size, header.block_count)?;
 
         files.push(FileEntry {
             path: path.to_string(),
@@ -189,7 +189,7 @@ fn decode_chunks(
     block_size: u32,
     block_count: u64,
 ) -> Result<Vec<u32>, ManifestError> {
-    let count = r.uleb()?;
+    let count: u64 = r.uleb()?;
     if count != expected_chunks(size, block_size) {
         return Err(ManifestError::ChunkMismatch {
             got: count,
@@ -201,9 +201,9 @@ fn decode_chunks(
         return Err(ManifestError::OverLimit(count, u64::from(MAX_BLOCKS)));
     }
 
-    let mut chunks = Vec::with_capacity(capacity(count));
+    let mut chunks: Vec<u32> = Vec::with_capacity(capacity(count));
     for _ in 0..count {
-        let idx = r.uleb()?;
+        let idx: u64 = r.uleb()?;
         if idx >= block_count {
             return Err(ManifestError::BlockIndexOob(idx, block_count as usize));
         }
@@ -223,8 +223,8 @@ pub fn decode(input: &[u8]) -> Result<Manifest, ManifestError> {
 
     let mut r = Reader::new(input);
     let header = Header::decode(&mut r)?;
-    let pool = decode_pool(&mut r, header.block_count)?;
-    let files = decode_files(&mut r, &header)?;
+    let pool: Vec<[u8; 32]> = decode_pool(&mut r, header.block_count)?;
+    let files: Vec<FileEntry> = decode_files(&mut r, &header)?;
 
     if r.position() != input.len() {
         return Err(ManifestError::Trailing(input.len() - r.position()));

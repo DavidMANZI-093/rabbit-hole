@@ -20,7 +20,7 @@ const KNOWN_FLAGS: u16 = FLAG_UNIX_MODE | FLAG_MTIME;
 pub fn encode(m: &Manifest) -> Vec<u8> {
     debug_assert!(m.validate().is_ok(), "encode called with invalid manifest");
 
-    let mut out = Vec::with_capacity(16 + m.pool.len() * 32);
+    let mut out: Vec<u8> = Vec::with_capacity(16 + m.pool.len() * 32);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     let mut flags = 0u16;
@@ -39,7 +39,7 @@ pub fn encode(m: &Manifest) -> Vec<u8> {
     }
 
     for f in &m.files {
-        let pb = f.path.as_bytes();
+        let pb: &[u8] = f.path.as_bytes();
         encode_uleb(pb.len() as u64, &mut out);
         out.extend_from_slice(pb);
         encode_uleb(f.size, &mut out);
@@ -73,40 +73,40 @@ pub fn decode(input: &[u8]) -> Result<Manifest, ManifestError> {
         return Err(ManifestError::BadMagic);
     }
 
-    let version = r.u16_le()?;
+    let version: u16 = r.u16_le()?;
     if version != VERSION {
         return Err(ManifestError::UnsupportedVersion(version));
     }
 
-    let flags = r.u16_le()?;
+    let flags: u16 = r.u16_le()?;
     if flags & !KNOWN_FLAGS != 0 {
         return Err(ManifestError::UnknownFlags(flags));
     }
 
-    let block_size = r.u32_le()?;
+    let block_size: u32 = r.u32_le()?;
     if !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block_size) {
         return Err(ManifestError::BadBlockSize(block_size));
     }
 
-    let file_count = r.uleb()?;
+    let file_count: u64 = r.uleb()?;
     if file_count > MAX_FILES as u64 {
         return Err(ManifestError::OverLimit(file_count, MAX_FILES as u64));
     }
 
-    let block_count = r.uleb()?;
+    let block_count: u64 = r.uleb()?;
     if block_count > MAX_BLOCKS as u64 {
         return Err(ManifestError::OverLimit(block_count, MAX_BLOCKS as u64));
     }
 
-    let mut pool = Vec::with_capacity(block_count.min(1 << 20) as usize);
+    let mut pool: Vec<[u8; 32]> = Vec::with_capacity(block_count.min(1 << 20) as usize);
     for _ in 0..block_count {
         let mut h = [0u8; 32];
         h.copy_from_slice(r.take(32)?);
         pool.push(h);
     }
 
-    let mut files = Vec::with_capacity(file_count.min(1 << 20) as usize);
-    let mut seen = HashSet::with_capacity(files.capacity());
+    let mut files: Vec<FileEntry> = Vec::with_capacity(file_count.min(1 << 20) as usize);
+    let mut seen: HashSet<String> = HashSet::with_capacity(files.capacity());
 
     for _ in 0..file_count {
         let plen = r.uleb()?;
@@ -114,28 +114,28 @@ pub fn decode(input: &[u8]) -> Result<Manifest, ManifestError> {
             return Err(ManifestError::OverLimit(plen, MAX_PATH_LEN as u64));
         }
 
-        let path =
+        let path: &str =
             std::str::from_utf8(r.take(plen as usize)?).map_err(|_| ManifestError::BadUtf8)?;
         validate_path(path)?;
         if !seen.insert(path.to_string()) {
             return Err(ManifestError::DuplicatePath(path.to_string()));
         }
 
-        let size = r.uleb()?;
+        let size: u64 = r.uleb()?;
 
-        let mode = if flags & FLAG_UNIX_MODE != 0 {
+        let mode: Option<u32> = if flags & FLAG_UNIX_MODE != 0 {
             Some(r.u32_le()?)
         } else {
             None
         };
 
-        let mtime_ns = if flags & FLAG_MTIME != 0 {
+        let mtime_ns: Option<i64> = if flags & FLAG_MTIME != 0 {
             Some(r.i64_le()?)
         } else {
             None
         };
 
-        let chunk_count = r.uleb()?;
+        let chunk_count: u64 = r.uleb()?;
         if chunk_count != expected_chunks(size, block_size) {
             return Err(ManifestError::ChunkMismatch {
                 got: chunk_count,
@@ -146,9 +146,9 @@ pub fn decode(input: &[u8]) -> Result<Manifest, ManifestError> {
         if chunk_count > MAX_BLOCKS as u64 {
             return Err(ManifestError::OverLimit(chunk_count, MAX_BLOCKS as u64));
         }
-        let mut chunks = Vec::with_capacity(chunk_count.min(1 << 20) as usize);
+        let mut chunks: Vec<u32> = Vec::with_capacity(chunk_count.min(1 << 20) as usize);
         for _ in 0..chunk_count {
-            let idx = r.uleb()?;
+            let idx: u64 = r.uleb()?;
             if idx >= block_count {
                 return Err(ManifestError::BlockIndexOob(idx, pool.len()));
             }

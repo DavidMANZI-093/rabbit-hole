@@ -67,8 +67,8 @@ pub fn print_serve_details(lan: &str, wan: Option<&str>, code: Option<&str>, tok
         }
     }
 
-    let target = code.or(wan).unwrap_or(lan);
-    let bearer = token.map(|t| format!(" --bearer {t}")).unwrap_or_default();
+    let target: &str = code.or(wan).unwrap_or(lan);
+    let bearer: String = token.map(|t| format!(" --bearer {t}")).unwrap_or_default();
     let fetch_cmd = format!("`rh fetch {target} <dest>{bearer}`");
 
     info!("");
@@ -115,9 +115,9 @@ impl FetchSummary {
 }
 
 pub fn print_fetch_summary(summary: &FetchSummary, dest: &Path) {
-    let status = if summary.ok { "done" } else { &red("failed") };
-    let line = summary_line(summary, dest);
-    let rest = line.strip_prefix(status).unwrap_or(&line);
+    let status: &str = if summary.ok { "done" } else { &red("failed") };
+    let line: String = summary_line(summary, dest);
+    let rest: &str = line.strip_prefix(status).unwrap_or(&line);
     info!("");
     info!("{status}{rest}");
     info!("");

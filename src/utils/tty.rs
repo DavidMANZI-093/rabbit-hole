@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
+    collections::HashMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -18,10 +19,10 @@ static HEADLINE_WIDTH: AtomicUsize = AtomicUsize::new(0);
 // ---------- capability ----------
 
 pub fn init(no_color_flag: bool) {
-    let tty = is_tty();
-    let vt_ok = enable_vt();
-    let legacy = legacy_console();
-    let env = [
+    let tty: bool = is_tty();
+    let vt_ok: bool = enable_vt();
+    let legacy: bool = legacy_console();
+    let env: HashMap<String, String> = [
         "NO_COLOR",
         "CLICOLOR",
         "FORCE_COLOR",
@@ -216,7 +217,7 @@ impl Dots {
     }
 
     fn start_with(msg: &str, every: Duration) -> Self {
-        let muted = !is_tty();
+        let muted: bool = !is_tty();
         let inner = Arc::new(Mutex::new(DotsInner {
             msg: msg.to_string(),
             frame: 0,

@@ -9,7 +9,7 @@ use crate::{
     report::{FetchSummary, print_cloudflared_status, print_fetch_summary, print_serve_details},
     services::{
         cloudflared, edge,
-        fetch::fetch,
+        fetch::{FetchStats, fetch},
         ingest::ingest,
         serve::Server,
         share::{Shared, build_shared, generate_token},
@@ -160,11 +160,11 @@ struct FetchOpts {
 }
 
 async fn run_fetch(opts: FetchOpts) -> Result<(), String> {
-    let url = resolve(&opts.code_or_url, &opts.edge).await?;
+    let url: String = resolve(&opts.code_or_url, &opts.edge).await?;
     info!("fetching from {}", url);
 
     let progress = FetchProgress::new();
-    let result = fetch(
+    let result: Result<FetchStats, String> = fetch(
         &url,
         &opts.dest,
         opts.timeout,

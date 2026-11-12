@@ -114,12 +114,12 @@ fn router(shared: Arc<Shared>) -> Router {
 
 // --- req ----------------------
 //
-// GET /__rh__/manifest HTTP/1
+// GET /__rh__/manifest HTTP/1.1
 // Authorization: Bearer <token>
 //
 // --- res ----------------------
 //
-// HTTP/1 200 OK
+// HTTP/1.1 200 OK
 // content-type: application/x-rhbm-v1
 // content-length: <manifest-bytes-length>
 //
@@ -142,12 +142,12 @@ async fn h_manifest(
 
 // --- req ----------------------
 //
-// GET /__rh__/block/<32-byte-hex-hash> HTTP/1
+// GET /__rh__/block/<32-byte-hex-hash> HTTP/1.1
 // Authorization: Bearer <token>
 //
 // --- res ----------------------
 //
-// HTTP/1 200 OK
+// HTTP/1.1 200 OK
 // content-type: application/octet-stream
 // content-length: <block-bytes-length>
 //
@@ -186,11 +186,11 @@ async fn h_block(
 
 // --- req ----------------------
 //
-// GET /__rh__/health HTTP/1
+// GET /__rh__/health HTTP/1.1
 //
 // --- res ----------------------
 //
-// HTTP/1 200 OK
+// HTTP/1.1 200 OK
 // content-type: text/plain; charset=utf-8
 // content-length: 2
 //

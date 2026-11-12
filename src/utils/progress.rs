@@ -64,6 +64,7 @@ impl IngestProgress {
     }
 
     // Only for tests (no need for tty).
+    #[doc(hidden)]
     pub fn _new() -> Self {
         Self::build(String::new(), true)
     }

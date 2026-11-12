@@ -12,12 +12,18 @@ use reqwest::Client;
 
 use crate::{
     error, info,
-    protocol::manifest::{
-        CURRENT, Manifest,
-        common::{ManifestError, hex_encode},
-        v1::MAGIC,
+    protocol::{
+        self,
+        manifest::{
+            CURRENT, Manifest,
+            common::{ManifestError, hex_encode},
+            v1::MAGIC,
+        },
     },
-    utils::{self, format::format_bytes, fs::system_time_from_ns, progress::FetchProgress},
+    utils::{
+        self, dns::DynamicDnsState, format::format_bytes, fs::system_time_from_ns,
+        progress::FetchProgress,
+    },
     warn,
 };
 
@@ -43,31 +49,31 @@ pub async fn fetch(
     concurrency: u8,
     progress: &FetchProgress,
 ) -> Result<FetchStats, String> {
-    let base = normalize_base(url)?;
-    let client = build_client(&base, timeout).await?;
-    let (manifest, wire_len) = pull_manifest(&client, &base, bearer.as_deref()).await?;
+    let base: String = normalize_base(url)?;
+    let client: reqwest::Client = build_client(&base, timeout).await?;
+    let (manifest, raw_len) = pull_manifest(&client, &base, bearer.as_deref()).await?;
     let manifest = Arc::new(manifest);
 
     let (files, targets) = {
         let dest = dest.to_path_buf();
         let manifest = manifest.clone();
         tokio::task::spawn_blocking(move || {
-            let preflight = preflight_dest(&dest, &manifest, force)?;
-            let files = create_outputs(&dest, &manifest, &preflight.needs_write)?;
-            let targets = plan_blocks(&manifest, &preflight.verified);
+            let preflight: Preflight = preflight_dest(&dest, &manifest, force)?;
+            let files: Vec<OutputFile> = create_outputs(&dest, &manifest, &preflight.needs_write)?;
+            let targets: HashMap<[u8; 32], Vec<(usize, u64)>> =
+                plan_blocks(&manifest, &preflight.verified);
             Ok::<_, String>((files, targets))
         })
         .await
         .map_err(|e| format!("prepare destination: {e}"))??
     };
-    let files = Arc::new(files);
+    let files: Arc<Vec<OutputFile>> = Arc::new(files);
 
-    let n_unique = targets.len();
+    let n_unique: usize = targets.len();
     let bytes_total: u64 = manifest.files.iter().map(|f| f.size).sum();
-
     info!(
         "manifest size {}, {}:v{} protocol\nfiles {} ({} total, {} blocks to fetch)",
-        format_bytes(wire_len),
+        format_bytes(raw_len),
         std::str::from_utf8(&MAGIC).unwrap_or("?"),
         CURRENT,
         manifest.files.len(),
@@ -76,7 +82,6 @@ pub async fn fetch(
     );
 
     progress.begin(manifest.files.len(), n_unique as u64, bytes_total);
-
     let fetcher = Fetcher::new(
         client,
         &base,
@@ -110,7 +115,7 @@ pub async fn fetch(
 async fn build_client(base: &str, timeout: u32) -> Result<Client, String> {
     let mut builder = Client::builder().timeout(Duration::from_millis(timeout as u64));
     if let Some(host) = tunnel_host(base) {
-        let state = crate::utils::dns::resolve_all_doh(host).await;
+        let state: DynamicDnsState = utils::dns::resolve_all_doh(host).await;
         if !state.addrs.is_empty() {
             builder = builder.resolve_to_addrs(host, &state.addrs);
         }
@@ -119,10 +124,10 @@ async fn build_client(base: &str, timeout: u32) -> Result<Client, String> {
 }
 
 fn tunnel_host(base: &str) -> Option<&str> {
-    let rest = base
+    let rest: &str = base
         .strip_prefix("https://")
         .or_else(|| base.strip_prefix("http://"))?;
-    let host = rest.split('/').next().unwrap_or("");
+    let host: &str = rest.split('/').next().unwrap_or("");
     host.ends_with(".trycloudflare.com").then_some(host)
 }
 
@@ -137,7 +142,7 @@ fn create_outputs(
     manifest: &Manifest,
     needs_write: &[bool],
 ) -> Result<Vec<OutputFile>, String> {
-    let mut out = Vec::with_capacity(manifest.files.len());
+    let mut out: Vec<OutputFile> = Vec::with_capacity(manifest.files.len());
     for (fi, f) in manifest.files.iter().enumerate() {
         if !needs_write[fi] {
             out.push(OutputFile {
@@ -148,7 +153,7 @@ fn create_outputs(
             continue;
         }
 
-        let abs = dest.join(&f.path);
+        let abs: PathBuf = dest.join(&f.path);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -229,7 +234,7 @@ impl Fetcher {
                 record_task(res, &self.progress, &mut failed, &mut err_lines);
             }
 
-            let fetcher = self.clone();
+            let fetcher: Fetcher = self.clone();
             set.spawn(async move { fetcher.download(digest, &locs).await });
         }
 
@@ -249,7 +254,7 @@ impl Fetcher {
     }
 
     async fn download(&self, digest: [u8; 32], locs: &[(usize, u64)]) -> Result<(), String> {
-        let result = self.try_download(digest, locs).await;
+        let result: Result<(), String> = self.try_download(digest, locs).await;
         if result.is_err() {
             self.progress.inc_failed();
         }
@@ -257,7 +262,7 @@ impl Fetcher {
     }
 
     async fn try_download(&self, digest: [u8; 32], locs: &[(usize, u64)]) -> Result<(), String> {
-        let hex = hex_encode(&digest);
+        let hex: String = hex_encode(&digest);
         let mut last_err = String::new();
 
         for attempt in 1..=(1 + RETRIES) {
@@ -272,9 +277,9 @@ impl Fetcher {
             {
                 Ok(data) => {
                     let data_len = data.len() as u64;
-                    let files = Arc::clone(&self.files);
-                    let locs = locs.to_vec();
-                    let write_hex = hex.clone();
+                    let files: Arc<Vec<OutputFile>> = Arc::clone(&self.files);
+                    let locs: Vec<(usize, u64)> = locs.to_vec();
+                    let write_hex: String = hex.clone();
                     tokio::task::spawn_blocking(move || {
                         write_block(&files, &data, &locs, &write_hex)
                     })
@@ -309,7 +314,7 @@ fn write_block(
     hex: &str,
 ) -> Result<(), String> {
     for &(fi, off) in locs {
-        let target = &files[fi];
+        let target: &OutputFile = &files[fi];
         let Some(file) = target.file.as_ref() else {
             return Err(format!(
                 "internal: no writable output for {} at offset {off}",
@@ -317,7 +322,7 @@ fn write_block(
             ));
         };
         let len = (data.len() as u64).min(target.size.saturating_sub(off));
-        if let Err(e) = crate::utils::fs::write_at(file, &data[..len as usize], off) {
+        if let Err(e) = utils::fs::write_at(file, &data[..len as usize], off) {
             return Err(format!("write block {hex} at {off}: {e}"));
         }
     }
@@ -382,7 +387,7 @@ fn restore_metadata(dest: &Path, manifest: &Manifest) -> Result<(), String> {
 }
 
 pub fn normalize_base(url: &str) -> Result<String, String> {
-    let s = url.trim();
+    let s: &str = url.trim();
     if s.starts_with("http://") || s.starts_with("https://") {
         return Ok(s.trim_end_matches('/').to_string());
     }
@@ -399,28 +404,30 @@ pub async fn pull_manifest(
 ) -> Result<(Manifest, u64), String> {
     let mut last_err = String::new();
     for attempt in 1..=(1 + RETRIES) {
-        let mut req = client.get(format!("{base}/__rh__/manifest"));
+        let mut req: reqwest::RequestBuilder = client.get(format!("{base}/__rh__/manifest"));
         if let Some(t) = token {
             req = req.header("Authorization", format!("Bearer {t}"));
         }
 
         match req.send().await {
             Ok(res) => match res.status() {
+                // 200 OK
                 s if s.is_success() => {
                     let bytes = res
                         .bytes()
                         .await
                         .map_err(|e| format!("read manifest body: {e}"))?;
-                    let wire_len = bytes.len() as u64;
+                    let raw_len = bytes.len() as u64;
                     let bytes = bytes.to_vec();
-                    let manifest =
-                        crate::protocol::manifest::decode(&bytes).map_err(decode_error)?;
+                    let manifest = protocol::manifest::decode(&bytes).map_err(decode_error)?;
 
-                    return Ok((manifest, wire_len));
+                    return Ok((manifest, raw_len));
                 }
+                // 401 UNAUTHORIZED
                 s if s.as_u16() == 401 => {
                     return Err("manifest: 401 — wrong or missing --token".into());
                 }
+                // OTHERS
                 s => last_err = format!("manifest: edge returned {s}"),
             },
             Err(e) => last_err = format!("manifest: {e}"),
@@ -430,7 +437,7 @@ pub async fn pull_manifest(
                 "manifest: not reachable (attempt {attempt}/{}), retrying...",
                 RETRIES + 1
             );
-            // manifest retries use 5×attempt delays (5s/10s/15s) — cold edge routes need longer warm-up
+            // manifest retries use 'attemp * 5' delays (5s/10s/15s)
             tokio::time::sleep(Duration::from_secs(5 * attempt as u64)).await;
         }
     }
@@ -438,8 +445,6 @@ pub async fn pull_manifest(
     Err(last_err)
 }
 
-// Decode failure as a user-facing error. Version mismatch names the
-// remedy (upgrade); everything else reports the parse failure..
 fn decode_error(e: ManifestError) -> String {
     match e {
         ManifestError::UnsupportedVersion(v) => {
@@ -479,12 +484,12 @@ fn preflight_dest(dest: &Path, manifest: &Manifest, force: bool) -> Result<Prefl
         conflicts: Vec::new(),
     };
 
-    for (fi, f) in manifest.files.iter().enumerate() {
+    for (idx, f) in manifest.files.iter().enumerate() {
         let abs = dest.join(&f.path);
         let meta = match std::fs::symlink_metadata(&abs) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                preflight.needs_write[fi] = true;
+                preflight.needs_write[idx] = true;
                 continue;
             }
             Err(e) => return Err(format!("stat {}: {e}", abs.display())),
@@ -499,19 +504,20 @@ fn preflight_dest(dest: &Path, manifest: &Manifest, force: bool) -> Result<Prefl
         let file = std::fs::File::open(&abs).map_err(|e| format!("open {}: {e}", abs.display()))?;
         let file_len = meta.len();
         let mut all_match = file_len == f.size;
-        for (j, chunk) in f.chunks.iter().enumerate() {
-            let offset = j as u64 * block_size;
+        for (nth, chunk) in f.chunks.iter().enumerate() {
+            let offset = nth as u64 * block_size;
             let len = block_size.min(f.size.saturating_sub(offset)) as usize;
             if file_len >= offset + len as u64
                 && block_matches(&file, offset, len, &manifest.pool[*chunk as usize])
             {
-                preflight.verified[fi][j] = true;
+                // 'idx': file index, 'nth': chunk index.
+                preflight.verified[idx][nth] = true;
             } else {
                 all_match = false;
             }
         }
         if !all_match {
-            preflight.needs_write[fi] = true;
+            preflight.needs_write[idx] = true;
             preflight.conflicts.push(abs);
         }
     }
@@ -599,8 +605,6 @@ mod tests {
     use super::*;
     use crate::protocol::manifest::FileEntry;
 
-    // --- decode_error ---
-
     #[test]
     fn upgrade_message_names_version() {
         let msg = decode_error(ManifestError::UnsupportedVersion(2));
@@ -617,11 +621,8 @@ mod tests {
         );
     }
 
-    // --- fail-closed fetch ---
-
     #[tokio::test]
     async fn garbage_manifest_fails_before_touching_dest() {
-        // Stub origin serving 3 non-manifest bytes behind a valid envelope.
         // Decode failure returns via `?` immediately (no retry backoff).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -660,8 +661,6 @@ mod tests {
         assert!(!dest.exists(), "dest must stay untouched on decode failure");
         let _ = std::fs::remove_dir_all(&dest);
     }
-
-    // --- normalize_base ---
 
     #[test]
     fn strips_trailing_slash_from_https_url() {
@@ -710,8 +709,6 @@ mod tests {
         assert!(normalize_base("").is_err());
     }
 
-    // --- tunnel_host ---
-
     #[test]
     fn tunnel_host_matches_only_trycloudflare() {
         assert_eq!(
@@ -721,8 +718,6 @@ mod tests {
         assert_eq!(tunnel_host("http://127.0.0.1:8080"), None);
         assert_eq!(tunnel_host("https://example.com/x"), None);
     }
-
-    // --- block planning / outputs ---
 
     #[test]
     fn plan_blocks_deduplicates_repeated_digests() {
@@ -867,8 +862,6 @@ mod tests {
         drop(files);
         std::fs::remove_dir_all(&dir).ok();
     }
-
-    // --- preflight_dest ---
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
+    collections::HashMap,
     fmt,
     fs::File,
     io,
@@ -229,7 +230,7 @@ pub fn write_at(f: &File, buf: &[u8], offset: u64) -> Result<usize, FsError> {
 
 // windows/macOS would silently merge case-variant names — hard-error instead
 pub fn find_case_collision<S: AsRef<str>>(paths: &[S]) -> Option<(String, String)> {
-    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
     for (i, p) in paths.iter().enumerate() {
         let folded = p.as_ref().to_lowercase();
         if let Some(prev_i) = seen.insert(folded, i) {

@@ -1,6 +1,8 @@
 // Copyright (c) 2026 David MANZI
 // SPDX-License-Identifier: MIT
 
+use std::collections::HashSet;
+
 use crate::protocol::manifest::common::{
     MAX_BLOCK_SIZE, MAX_BLOCKS, MAX_FILES, MAX_MANIFEST_BYTES, MAX_PATH_LEN, MIN_BLOCK_SIZE,
     ManifestError, expected_chunks, validate_path,
@@ -67,7 +69,7 @@ impl Manifest {
                 }
             }
         }
-        let mut seen = std::collections::HashSet::with_capacity(self.files.len());
+        let mut seen: HashSet<&String> = HashSet::with_capacity(self.files.len());
         for f in &self.files {
             if f.path.len() > MAX_PATH_LEN {
                 return Err(ManifestError::OverLimit(
@@ -79,7 +81,7 @@ impl Manifest {
             if !seen.insert(&f.path) {
                 return Err(ManifestError::DuplicatePath(f.path.clone()));
             }
-            let want = expected_chunks(f.size, self.block_size);
+            let want: u64 = expected_chunks(f.size, self.block_size);
             if f.chunks.len() as u64 != want {
                 return Err(ManifestError::ChunkMismatch {
                     got: f.chunks.len() as u64,

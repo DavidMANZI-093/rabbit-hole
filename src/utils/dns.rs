@@ -46,9 +46,9 @@ pub async fn resolve_all_doh(host: &str) -> DynamicDnsState {
     let cf_url = format!("https://1.1.1.1/dns-query?name={host}&type=A");
     let google_url = format!("https://8.8.8.8/resolve?name={host}&type=A");
 
-    let wire_query = build_dns_wirequery(host);
-    let wire_b64 = base64_url_encode(&wire_query);
-    let quad9_url = format!("https://dns.quad9.net/dns-query?dns={wire_b64}");
+    let raw_query: Vec<u8> = build_dns_raw_query(host);
+    let raw_b64: String = base64_url_encode(&raw_query);
+    let quad9_url = format!("https://dns.quad9.net/dns-query?dns={raw_b64}");
 
     let cf_fut = client
         .get(&cf_url)
@@ -65,15 +65,13 @@ pub async fn resolve_all_doh(host: &str) -> DynamicDnsState {
         .header("Accept", "application/dns-message")
         .send();
 
-    // All three providers are fetched concurrently in a single round-trip.
-    // IPs are parsed once and reused for both status reporting and addr collection.
     let (cf_res, google_res, quad9_res) = tokio::join!(cf_fut, google_fut, quad9_fut);
 
     let (cf_status, cf_ips) = match cf_res {
         Ok(r) => match r.text().await {
             Ok(t) => {
-                let ips = parse_doh_json_ips(&t);
-                let status = if ips.is_empty() {
+                let ips: Vec<SocketAddr> = parse_doh_json_ips(&t);
+                let status: ProviderStatus = if ips.is_empty() {
                     ProviderStatus::Failed
                 } else {
                     ProviderStatus::Ok(ips.len())
@@ -88,8 +86,8 @@ pub async fn resolve_all_doh(host: &str) -> DynamicDnsState {
     let (google_status, google_ips) = match google_res {
         Ok(r) => match r.text().await {
             Ok(t) => {
-                let ips = parse_doh_json_ips(&t);
-                let status = if ips.is_empty() {
+                let ips: Vec<SocketAddr> = parse_doh_json_ips(&t);
+                let status: ProviderStatus = if ips.is_empty() {
                     ProviderStatus::Failed
                 } else {
                     ProviderStatus::Ok(ips.len())
@@ -104,8 +102,8 @@ pub async fn resolve_all_doh(host: &str) -> DynamicDnsState {
     let (quad9_status, quad9_ips) = match quad9_res {
         Ok(r) => match r.bytes().await {
             Ok(b) => {
-                let ips = parse_dns_wire_ips(&b);
-                let status = if ips.is_empty() {
+                let ips: Vec<SocketAddr> = parse_dns_raw_ips(&b);
+                let status: ProviderStatus = if ips.is_empty() {
                     ProviderStatus::Failed
                 } else {
                     ProviderStatus::Ok(ips.len())
@@ -117,7 +115,6 @@ pub async fn resolve_all_doh(host: &str) -> DynamicDnsState {
         Err(_) => (ProviderStatus::Failed, Vec::new()),
     };
 
-    // Deduplicate addrs collected from all three providers — no second HTTP round-trip.
     let mut addrs: Vec<SocketAddr> = Vec::new();
     for ip in cf_ips.into_iter().chain(google_ips).chain(quad9_ips) {
         if !addrs.contains(&ip) {
@@ -134,8 +131,8 @@ pub async fn resolve_all_doh(host: &str) -> DynamicDnsState {
 }
 
 pub fn parse_doh_json_ips(json: &str) -> Vec<SocketAddr> {
-    let mut addrs = Vec::new();
-    let mut search = json;
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    let mut search: &str = json;
     while let Some(pos) = search.find("\"data\":") {
         search = &search[pos + 7..];
         let search_trimmed = search.trim_start();
@@ -152,7 +149,7 @@ pub fn parse_doh_json_ips(json: &str) -> Vec<SocketAddr> {
     addrs
 }
 
-pub fn build_dns_wirequery(host: &str) -> Vec<u8> {
+pub fn build_dns_raw_query(host: &str) -> Vec<u8> {
     let mut buf = vec![
         0x00, 0x00, // ID
         0x01, 0x00, // Flags: RD = 1
@@ -173,7 +170,7 @@ pub fn build_dns_wirequery(host: &str) -> Vec<u8> {
     buf
 }
 
-pub fn parse_dns_wire_ips(buf: &[u8]) -> Vec<SocketAddr> {
+pub fn parse_dns_raw_ips(buf: &[u8]) -> Vec<SocketAddr> {
     let mut addrs = Vec::new();
     if buf.len() < 12 {
         return addrs;
@@ -274,7 +271,7 @@ mod tests {
 
     #[test]
     fn wire_query_building_is_valid() {
-        let q = build_dns_wirequery("google.com");
+        let q = build_dns_raw_query("google.com");
         assert_eq!(q[0..2], [0, 0]);
         assert_eq!(q[12], 6); // 'google' length
     }

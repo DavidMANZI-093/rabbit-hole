@@ -71,7 +71,7 @@ impl std::error::Error for ManifestError {}
 
 pub fn encode_uleb(mut v: u64, out: &mut Vec<u8>) {
     loop {
-        let mut b = (v & 0x7f) as u8;
+        let mut b: u8 = (v & 0x7f) as u8;
         v >>= 7;
         if v != 0 {
             b |= 0x80;
@@ -103,14 +103,14 @@ impl<'a> Reader<'a> {
     }
 
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], ManifestError> {
-        let end = self.pos.checked_add(n).ok_or(ManifestError::Overflow)?;
+        let end: usize = self.pos.checked_add(n).ok_or(ManifestError::Overflow)?;
         if end > self.buf.len() {
             return Err(ManifestError::Truncated {
                 at: self.pos,
                 need: n,
             });
         }
-        let s = &self.buf[self.pos..end];
+        let s: &[u8] = &self.buf[self.pos..end];
         self.pos = end;
         Ok(s)
     }
@@ -139,7 +139,7 @@ impl<'a> Reader<'a> {
     }
 
     pub fn uleb(&mut self) -> Result<u64, ManifestError> {
-        let start = self.pos;
+        let start: usize = self.pos;
         let mut val: u64 = 0;
         let mut shift = 0u32;
         loop {
@@ -149,13 +149,13 @@ impl<'a> Reader<'a> {
             if shift >= 70 {
                 return Err(ManifestError::Overflow);
             }
-            let b = self.buf[self.pos];
+            let b: u8 = self.buf[self.pos];
             self.pos += 1;
             if shift >= 64 && (b & 0x7f) != 0 {
                 return Err(ManifestError::Overflow);
             }
             val |= ((b & 0x7f) as u64) << shift;
-            let done = b & 0x80 == 0;
+            let done: bool = b & 0x80 == 0;
             shift += 7;
             if done {
                 if self.pos - start != encoded_uleb_len(val) {
@@ -170,7 +170,7 @@ impl<'a> Reader<'a> {
     }
 
     pub fn uleb_limited(&mut self, max: u64) -> Result<u64, ManifestError> {
-        let n = self.uleb()?;
+        let n: u64 = self.uleb()?;
         if n > max {
             return Err(ManifestError::OverLimit(n, max));
         }
@@ -226,11 +226,11 @@ pub fn hex_decode32(s: &str) -> Result<[u8; 32], ManifestError> {
     if s.len() != 64 {
         return Err(ManifestError::BadHex("need 64 hex chars"));
     }
-    let b = s.as_bytes();
+    let b: &[u8] = s.as_bytes();
     let mut out = [0u8; 32];
     for i in 0..32 {
-        let hi = hexval(b[2 * i]).ok_or(ManifestError::BadHex("bad digit"))?;
-        let lo = hexval(b[2 * i + 1]).ok_or(ManifestError::BadHex("bad digit"))?;
+        let hi: u8 = hexval(b[2 * i]).ok_or(ManifestError::BadHex("bad digit"))?;
+        let lo: u8 = hexval(b[2 * i + 1]).ok_or(ManifestError::BadHex("bad digit"))?;
         out[i] = hi << 4 | lo;
     }
     Ok(out)
