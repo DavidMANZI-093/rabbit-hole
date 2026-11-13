@@ -48,12 +48,28 @@ struct ClaimReq<'a> {
     url: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     want: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<&'a str>,
     ttl: u16,
 }
 
 #[derive(Deserialize)]
 struct ClaimRes {
     code: String,
+    #[serde(default)]
+    owner: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Remembered {
+    code: String,
+    #[serde(default)]
+    owner: Option<String>,
+}
+
+pub struct Claimed {
+    pub code: String,
+    pub owner: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -85,15 +101,24 @@ impl EdgeClient {
         &self,
         url: &str,
         want: Option<&str>,
+        owner: Option<&str>,
         ttl: u16,
-    ) -> Result<String, EdgeError> {
+    ) -> Result<Claimed, EdgeError> {
         if let Some(w) = want {
             validate_code(w)?;
+        }
+        if let Some(o) = owner {
+            validate_owner(o)?;
         }
         let res = self
             .http
             .post(format!("{}/claim", self.base))
-            .json(&ClaimReq { url, want, ttl })
+            .json(&ClaimReq {
+                url,
+                want,
+                owner,
+                ttl,
+            })
             .send()
             .await?;
 
@@ -104,7 +129,13 @@ impl EdgeClient {
                     .await
                     .map_err(|e| EdgeError::Other(e.to_string()))?;
                 validate_code(&body.code)?;
-                Ok(body.code)
+                if let Some(ref owner) = body.owner {
+                    validate_owner(owner)?;
+                }
+                Ok(Claimed {
+                    code: body.code,
+                    owner: body.owner,
+                })
             }
             s if s.as_u16() == 409 => Err(EdgeError::Taken),
             s => Err(EdgeError::Other(format!("claim: edge returned {s}"))),
@@ -119,27 +150,33 @@ impl EdgeClient {
         ttl: u16,
         memory: &Path,
     ) -> Result<String, EdgeError> {
-        let want = tokio::fs::read_to_string(memory)
-            .await
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| validate_code(s).is_ok());
+        let mut candidate: Option<Remembered> = read_memory(memory).await;
 
-        if let Some(ref code) = want {
-            debug!("edge: trying remembered code {code:?}");
+        if let Some(ref r) = candidate {
+            debug!("edge: trying remembered code {:?}", r.code);
         }
 
         let mut attempts = 0u8;
-        let mut candidate = want;
         loop {
-            match self.claim(url, candidate.as_deref(), ttl).await {
-                Ok(code) => {
-                    debug!("edge: claimed code {code:?} after {attempts} collision(s)");
-                    if let Some(parent) = memory.parent() {
-                        tokio::fs::create_dir_all(parent).await.ok();
+            let want: Option<&str> = candidate.as_ref().map(|r| r.code.as_str());
+            let owner: Option<&str> = candidate.as_ref().and_then(|r| r.owner.as_deref());
+            match self.claim(url, want, owner, ttl).await {
+                Ok(claimed) => {
+                    debug!(
+                        "edge: claimed code {:?} after {attempts} collision(s)",
+                        claimed.code
+                    );
+                    let owner: Option<String> = claimed
+                        .owner
+                        .or_else(|| candidate.as_ref().and_then(|r| r.owner.clone()));
+                    let state = Remembered {
+                        code: claimed.code.clone(),
+                        owner,
+                    };
+                    if let Err(e) = write_memory(memory, &state).await {
+                        warn!("edge: cannot save code state: {e}");
                     }
-                    tokio::fs::write(memory, &code).await.ok();
-                    return Ok(code);
+                    return Ok(claimed.code);
                 }
                 Err(EdgeError::Taken) => {
                     attempts += 1;
@@ -149,7 +186,10 @@ impl EdgeClient {
                             "edge: {ROLL_ATTEMPTS} collisions in a row; try again later"
                         )));
                     }
-                    candidate = Some(roll_code());
+                    candidate = Some(Remembered {
+                        code: roll_code(),
+                        owner: None,
+                    });
                 }
                 Err(e) => return Err(e),
             }
@@ -177,11 +217,13 @@ impl EdgeClient {
         }
     }
 
-    pub async fn release(&self, code: &str) -> Result<(), EdgeError> {
+    pub async fn release(&self, code: &str, owner: &str) -> Result<(), EdgeError> {
         validate_code(code)?;
+        validate_owner(owner)?;
         let res = self
             .http
             .delete(format!("{}/c/{code}", self.base))
+            .bearer_auth(owner)
             .send()
             .await?;
         if res.status().is_success() {
@@ -195,6 +237,60 @@ impl EdgeClient {
     }
 }
 
+async fn read_memory(path: &Path) -> Option<Remembered> {
+    let raw: String = tokio::fs::read_to_string(path).await.ok()?;
+    parse_memory(&raw)
+}
+
+fn parse_memory(raw: &str) -> Option<Remembered> {
+    let raw: &str = raw.trim();
+    if raw.starts_with('{') {
+        let state: Remembered = serde_json::from_str(raw).ok()?;
+        validate_code(&state.code).ok()?;
+        if let Some(ref owner) = state.owner {
+            validate_owner(owner).ok()?;
+        }
+        return Some(state);
+    }
+    validate_code(raw).ok()?;
+    Some(Remembered {
+        code: raw.to_string(),
+        owner: None,
+    })
+}
+
+async fn write_memory(path: &Path, state: &Remembered) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let data: Vec<u8> = serde_json::to_vec(state).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::{
+            io::Write,
+            os::unix::fs::{OpenOptionsExt, PermissionsExt},
+        };
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+        file.write_all(&data).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, &data).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn validate_code(code: &str) -> Result<(), EdgeError> {
     if code.len() == CODE_LEN as usize && code.chars().all(|c| c.is_ascii_hexdigit()) {
         Ok(())
@@ -203,6 +299,20 @@ fn validate_code(code: &str) -> Result<(), EdgeError> {
             "bad code {code:?}: want {} hex chars",
             CODE_LEN
         )))
+    }
+}
+
+fn validate_owner(owner: &str) -> Result<(), EdgeError> {
+    if owner.len() == 64
+        && owner
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    {
+        Ok(())
+    } else {
+        Err(EdgeError::Other(
+            "bad owner secret: want 64 lowercase hex chars".into(),
+        ))
     }
 }
 
@@ -215,10 +325,8 @@ fn roll_code() -> String {
     )
 }
 
-// Best-effort claim that never fails the caller.
 // Returns `Some(code)` on success, `None` when the edge is unreachable/misbehaving
 // (caller falls back to sharing the direct URL).
-// Warnings are emitted via the `warn!` macro — no raw eprintln here.
 pub async fn try_claim_remembered(
     edge_base: &str,
     url: &str,
@@ -249,9 +357,9 @@ pub async fn remember_code(
     Some(code)
 }
 
-// Best-effort release — warns on failure, never panics.
-pub async fn try_release(client: &EdgeClient, code: &str) {
-    if let Err(e) = client.release(code).await {
+// Warns on failure, never panics.
+pub async fn try_release(client: &EdgeClient, code: &str, owner: &str) {
+    if let Err(e) = client.release(code, owner).await {
         warn!("edge release failed ({e})");
     }
 }
@@ -324,6 +432,76 @@ mod tests {
         assert!(validate_code("xyz123").is_err());
         assert!(validate_code("a3f9g1").is_err());
         assert!(validate_code("a3f9-1").is_err());
+    }
+
+    // --- validate_owner ---
+
+    #[test]
+    fn valid_owner_is_accepted() {
+        assert!(validate_owner(&"a".repeat(64)).is_ok());
+        assert!(validate_owner(&"0123456789abcdef".repeat(4)).is_ok());
+    }
+
+    #[test]
+    fn malformed_owner_is_rejected() {
+        assert!(validate_owner("").is_err());
+        assert!(validate_owner(&"a".repeat(63)).is_err());
+        assert!(validate_owner(&"a".repeat(65)).is_err());
+        assert!(validate_owner(&"A".repeat(64)).is_err());
+        assert!(validate_owner(&"g".repeat(64)).is_err());
+    }
+
+    // --- remembered state ---
+
+    #[test]
+    fn parses_legacy_code_state() {
+        let state = parse_memory("a3f9c1\n").expect("legacy state");
+        assert_eq!(state.code, "a3f9c1");
+        assert_eq!(state.owner, None);
+    }
+
+    #[test]
+    fn parses_owned_state() {
+        let owner = "b".repeat(64);
+        let raw = format!(r#"{{"code":"a3f9c1","owner":"{owner}"}}"#);
+        let state = parse_memory(&raw).expect("owned state");
+        assert_eq!(state.code, "a3f9c1");
+        assert_eq!(state.owner.as_deref(), Some(owner.as_str()));
+    }
+
+    #[test]
+    fn rejects_malformed_remembered_state() {
+        assert!(parse_memory("").is_none());
+        assert!(parse_memory("not-a-code").is_none());
+        assert!(parse_memory(r#"{"code":"a3f9c1","owner":"short"}"#).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remembered_state_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rh-edge-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("code");
+        let state = Remembered {
+            code: "a3f9c1".into(),
+            owner: Some("c".repeat(64)),
+        };
+
+        write_memory(&path, &state).await.expect("write state");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let restored = read_memory(&path).await.expect("read state");
+        assert_eq!(restored.code, state.code);
+        assert_eq!(restored.owner, state.owner);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // --- roll_code ---

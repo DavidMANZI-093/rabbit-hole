@@ -14,7 +14,9 @@ Terms used in this guide:
 
 - edge:  this Cloudflare Worker.
 - code:  a short string of 6 hex chars. It maps to one URL.
-- KV:    Cloudflare key-value storage. Key = code. Value = URL.
+- owner: a 64-hex-char secret returned once by /claim. The sender keeps it.
+- KV:    Cloudflare key-value storage. Key = code.
+  Value = JSON {"url": ..., "ownerHash": ...}.
 
 2. Operation (hosted service)
 -----------------------------
@@ -40,22 +42,25 @@ Request fields:
 
 - 'url' (required):  must start with 'http://' or 'https://'.
 - 'want' (optional): preferred code. Must be 6 hex chars.
+- 'owner' (optional): owner secret for re-claiming a code. 64 lowercase hex chars.
 - 'ttl' (optional):  lifetime in seconds. From 1 to 86400. Default is 14400.
 
 Responses:
 
-- 200 + {"code"}:   the claim is stored.
-- 409 + {"error"}:  the wanted code belongs to a different URL. Send
-  another 'want' value, or send no 'want' value.
-- 400 + {"error"}:  bad 'url', bad 'want', or bad 'ttl'.
+- 200 + {"code", "owner"}: a new claim is stored. Keep the owner secret.
+- 200 + {"code"}:   an existing code was refreshed with its owner.
+- 409 + {"error"}:  the wanted code is taken, has no owner, or the owner is wrong.
+  Send another 'want' value, or send no 'want' value.
+- 400 + {"error"}:  bad 'url', bad 'want', bad 'owner', or bad 'ttl'.
 
 NOTE: Both 'http://' and 'https://' URLs are accepted. 'http://' suits trusted
 LANs and local development only. Over untrusted networks it forfeits everything
 beyond block hashes: a meddler can substitute a whole self-consistent malicious
 manifest. Share public codes for 'https://' URLs only.
 
-NOTE: Re-share of the same URL keeps the same code and refreshes the TTL. This
-is by design.
+NOTE: Re-share with the owner secret keeps the same code and refreshes the TTL.
+The owner may also update the URL. A caller without the owner cannot re-point
+or release the code.
 
 3.2. GET /c/{code} — resolve a code to a URL.
 
@@ -67,11 +72,19 @@ Responses:
 
 Send header 'Accept: application/json'.
 
+Lookups are rate limited per source IP by the 'RH_LOOKUP_LIMITER' binding in
+wrangler.toml. An exceeded limit returns 429. Remove the binding only if a
+zone-level WAF rate limit already protects /c/*.
+
 3.3. DELETE /c/{code} — release a code.
 
-Response:
+Send header 'Authorization: Bearer <owner>'.
 
-- 200 in all cases. Delete of an unknown code also returns 200.
+Responses:
+
+- 200: the code was deleted, or it was already unknown and the owner was valid.
+- 401: the owner header is missing or malformed.
+- 403: the owner is wrong, or the code predates owner support.
 
 3.4. GET /health (and GET /) — service check.
 
@@ -121,7 +134,7 @@ Costs are per call. Free quotas reset daily at 00:00 UTC.
   but still count as a request.
 
 Free plan caps: 100000 Worker requests/day, 100000 KV reads/day, 1000 KV
-writes/day, 1 GB storage. One mapping is about 60 bytes.
+writes/day, 1 GB storage. One mapping is about 140 bytes.
 
 Budget: about 1000 shares/day (write-bound) and about 100000 fetches/day.
 Prototype use stays far below these caps.
@@ -162,8 +175,12 @@ release.
 9. Compatibility
 ----------------
 
-Client and edge must agree on three values: code shape (6 hex), default TTL
-(14400), and route paths (/claim, /c/{code}). These are defined in
-src/services/edge.rs (client) and src/index.js (edge). Change them together. There is no version
-negotiation on the edge API. The file manifest protocol (RHB1) is versioned
-separately and is not affected by edge changes.
+Client and edge must agree on four values: code shape (6 hex), owner shape
+(64 lowercase hex), default TTL (14400), and route paths (/claim, /c/{code}).
+These are defined in src/services/edge.rs (client) and src/index.js (edge).
+Change them together. There is no version negotiation on the edge API.
+
+Legacy KV values that contain a bare URL remain readable until they expire, but
+they cannot be released or re-claimed because they have no owner. The file
+manifest protocol (RHB1) is versioned separately and is not affected by edge
+changes.

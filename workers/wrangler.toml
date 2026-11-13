@@ -6,6 +6,14 @@ compatibility_date = "2026-09-09"
 binding = "RH_CODES"
 id      = "0d9766101ed8479081d129a9e3a11771"
 
+[[ratelimits]]
+name = "RH_LOOKUP_LIMITER"
+namespace_id = "1001"
+
+  [ratelimits.simple]
+  limit = 120
+  period = 60
+
 [observability.logs]
 enabled          = true
 invocation_logs  = true
