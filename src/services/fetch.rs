@@ -683,13 +683,20 @@ mod tests {
             .expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
         tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
-                use tokio::io::AsyncWriteExt;
-                let _ = sock
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nXYZ",
-                    )
-                    .await;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = [0u8; 1024];
+                    let _ = sock.read(&mut request).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nXYZ",
+                        )
+                        .await;
+                });
             }
         });
         let dest =
