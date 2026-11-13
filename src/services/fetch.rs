@@ -398,7 +398,7 @@ fn restore_metadata(dest: &Path, manifest: &Manifest) -> Result<(), String> {
         let meta = utils::fs::metadata(&abs).map_err(|e| e.to_string())?;
 
         if let Some(mode) = f.mode
-            && let Err(e) = utils::fs::apply_metadata(&abs, Some(mode), None)
+            && let Err(e) = utils::fs::apply_metadata(&abs, Some(mode & 0o777), None)
         {
             warn!("chmod {}: {e}", abs.display());
         }
@@ -943,6 +943,47 @@ mod tests {
                 chunks: vec![0],
             }],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_metadata_strips_special_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("special-bits");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        let mut manifest = one_block_manifest(b"hello");
+        manifest.files[0].mode = Some(0o6755);
+
+        restore_metadata(&dir, &manifest).expect("restore metadata");
+        let mode = std::fs::metadata(dir.join("a.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7000, 0, "setuid/setgid/sticky must not survive");
+        assert_eq!(mode & 0o777, 0o755);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_metadata_keeps_normal_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("normal-mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        let mut manifest = one_block_manifest(b"hello");
+        manifest.files[0].mode = Some(0o640);
+
+        restore_metadata(&dir, &manifest).expect("restore metadata");
+        let mode = std::fs::metadata(dir.join("a.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o640);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

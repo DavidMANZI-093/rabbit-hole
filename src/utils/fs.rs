@@ -121,7 +121,7 @@ pub fn metadata(path: &Path) -> Result<FileMeta, FsError> {
 #[cfg(unix)]
 fn unix_mode(meta: &std::fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
-    Some(meta.permissions().mode() & 0o7777)
+    Some(meta.permissions().mode() & 0o777)
 }
 
 #[cfg(not(unix))]
