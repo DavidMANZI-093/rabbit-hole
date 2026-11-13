@@ -297,6 +297,23 @@ mod tests {
     }
 
     #[test]
+    fn backslash_dotdot_is_rejected() {
+        assert!(validate_path("..\\..\\evil.txt").is_err());
+        assert!(validate_path("foo/..\\..\\evil.txt").is_err());
+    }
+
+    #[test]
+    fn windows_drive_prefix_is_rejected() {
+        assert!(validate_path("C:\\Users\\evil.txt").is_err());
+        assert!(validate_path("C:evil.txt").is_err());
+    }
+
+    #[test]
+    fn unc_prefix_is_rejected() {
+        assert!(validate_path("\\\\server\\share\\evil.txt").is_err());
+    }
+
+    #[test]
     fn simple_filename_is_accepted() {
         assert!(validate_path("hello.txt").is_ok());
     }
