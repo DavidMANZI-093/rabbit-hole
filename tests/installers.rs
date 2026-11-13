@@ -39,3 +39,72 @@ fn repo_stays_static_in_installer() {
         "repo must not be an overridable param"
     );
 }
+
+#[test]
+fn installers_parse() {
+    for script in ["install.sh", "uninstall.sh"] {
+        let Ok(status) = std::process::Command::new("bash")
+            .args(["-n", script])
+            .status()
+        else {
+            return;
+        };
+        assert!(status.success(), "{script} must pass `bash -n`");
+    }
+}
+
+#[test]
+fn unix_installer_does_not_require_unzip() {
+    let sh = read("install.sh");
+    assert!(
+        !sh.contains("need unzip"),
+        "unzip is missing on minimal images; it must stay an optional .zip fallback"
+    );
+    assert!(
+        sh.contains(".tar.gz"),
+        "install.sh must prefer the .tar.gz archive"
+    );
+}
+
+#[test]
+fn installers_resolve_latest_without_the_api() {
+    let latest = "https://github.com/$RH_REPO/releases/latest\"";
+    let sh = read("install.sh");
+    let redirect = sh
+        .find(latest)
+        .expect("install.sh must use the releases/latest redirect");
+    let api = sh.find("https://api.github.com").unwrap_or(usize::MAX);
+    assert!(
+        redirect < api,
+        "install.sh must try the redirect before the API"
+    );
+    let ps = read("install.ps1");
+    assert!(
+        ps.contains("https://github.com/$Repo/releases/latest\""),
+        "install.ps1 must use the releases/latest redirect"
+    );
+}
+
+#[test]
+fn installers_bound_network_waits() {
+    let sh = read("install.sh");
+    assert!(
+        sh.contains("--connect-timeout"),
+        "curl calls need a connect timeout so an unreachable host fails fast"
+    );
+}
+
+#[test]
+fn release_publishes_what_installers_fetch() {
+    let wf = read(".github/workflows/build.yml");
+    for needle in [".tar.gz", ".zip"] {
+        assert!(
+            wf.contains(needle),
+            "build.yml must publish {needle} archives"
+        );
+    }
+    // asset naming must agree between the workflow and the installers
+    assert!(wf.contains("name: rh-${{ github.ref_name }}-${{ matrix.target }}"));
+    assert!(read("install.sh").contains("ASSET=\"rh-$RH_VERSION-$TARGET\""));
+    assert!(read("install.ps1").contains("rh-$Version-$Target.zip"));
+}

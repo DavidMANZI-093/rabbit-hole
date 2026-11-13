@@ -26,12 +26,34 @@ $CfAsset = "cloudflared-windows-amd64.exe"
 
 # ------ Version resolution ------
 
+# Primary: the github.com "latest release" redirect (no API, no rate limit).
+# Fallback: the REST API. Either way the result must look like a tag.
+function Resolve-LatestVersion {
+    try {
+        $req = [Net.HttpWebRequest]::Create("https://github.com/$Repo/releases/latest")
+        $req.AllowAutoRedirect = $false
+        $req.Method = "HEAD"
+        $req.Timeout = 15000
+        $resp = $req.GetResponse()
+        try { $location = $resp.Headers["Location"] } finally { $resp.Close() }
+        if ($location -match '/releases/tag/(v[0-9][^/]*)$') { return $Matches[1] }
+    } catch { }
+    try {
+        $tag = (Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -TimeoutSec 15).tag_name
+        if ($tag -match '^v[0-9]') { return $tag }
+    } catch { }
+    return ""
+}
+
 if ([string]::IsNullOrEmpty($Version)) {
     Write-Host "  resolving latest rh release..."
-    $latest = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
-    $Version = $latest.tag_name
-    if ([string]::IsNullOrEmpty($Version)) { throw "could not resolve latest release" }
+    $Version = Resolve-LatestVersion
+    if ([string]::IsNullOrEmpty($Version)) {
+        throw "could not resolve latest release from github.com (check connectivity, or pass -Version vX.Y.Z)"
+    }
 }
+# accept "1.2.3" as well as "v1.2.3"
+if (-not $Version.StartsWith("v")) { $Version = "v$Version" }
 Write-Host "  rh $Version for $Target"
 
 # ------ Temporary working directory ------
@@ -53,7 +75,10 @@ try {
     } else {
         $zipUrl = "https://github.com/$Repo/releases/download/$Version/rh-$Version-$Target.zip"
         $zipPath = Join-Path $tmp "rh.zip"
-        Invoke-Step "download $zipUrl" { Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath }
+        Invoke-Step "download $zipUrl" {
+            try { Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing }
+            catch { throw "could not download rh $Version for $Target from $zipUrl (does the release exist?): $($_.Exception.Message)" }
+        }
         Invoke-Step "install $binDir\rh.exe" {
             New-Item -ItemType Directory -Path $binDir -Force | Out-Null
             Expand-Archive -Path $zipPath -DestinationPath $tmp -Force

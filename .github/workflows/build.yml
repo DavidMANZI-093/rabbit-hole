@@ -121,21 +121,24 @@ jobs:
         with:
           path: dist-artifacts
 
-      - name: package zips
-        shell: pwsh
+      - name: package archives
+        shell: bash
         run: |
-          $dest = Join-Path (Get-Location) "dist-zips"
-          New-Item -ItemType Directory -Path $dest -Force | Out-Null
-          Get-ChildItem -Path dist-artifacts -Directory | ForEach-Object {
-            Push-Location $_.FullName
-            try {
-              $bin = Get-ChildItem -File | Select-Object -First 1
-              Compress-Archive -Path $bin.Name -DestinationPath (Join-Path $dest "$($_.Name).zip")
-            } finally { Pop-Location }
-          }
+          set -euo pipefail
+          mkdir -p dist
+          for dir in dist-artifacts/*/; do
+            name="$(basename "$dir")"
+            bin="$(find "$dir" -maxdepth 1 -type f | head -n1)"
+            chmod 755 "$bin"
+            (cd "$dir" && zip -q -X "$OLDPWD/dist/$name.zip" "$(basename "$bin")")
+            if [[ "$name" != *windows* ]]; then
+              tar -C "$dir" --owner=0 --group=0 --numeric-owner -czf "dist/$name.tar.gz" "$(basename "$bin")"
+            fi
+          done
+          ls -l dist
 
       - name: attach to GitHub release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          files: dist-zips/*.zip
+          files: dist/*
           generate_release_notes: true
