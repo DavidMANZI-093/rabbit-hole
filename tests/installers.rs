@@ -110,9 +110,13 @@ fn release_publishes_what_installers_fetch() {
         wf.contains(".tar.gz"),
         "Unix must publish a .tar.gz archive"
     );
-    for needle in ["SHA256SUMS", "install.sh", "install.ps1"] {
+    for needle in ["SHA256SUMS", "sha256sum"] {
         assert!(wf.contains(needle), "build.yml must publish {needle}");
     }
+    assert!(
+        !wf.contains("cp install.sh"),
+        "build.yml must publish only release archives and SHA256SUMS"
+    );
     assert!(
         wf.contains("Cargo.toml") && wf.contains("GITHUB_REF_NAME"),
         "build.yml must check the tag against Cargo.toml"

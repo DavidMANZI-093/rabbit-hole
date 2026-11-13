@@ -134,12 +134,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
-
       - uses: actions/download-artifact@v7
         with:
           path: dist-artifacts
-
 
       - name: package archives + checksums
         shell: bash
@@ -156,7 +153,6 @@ jobs:
               tar -C "$dir" --owner=0 --group=0 --numeric-owner -czf "dist/$name.tar.gz" "$(basename "$bin")"
             fi
           done
-          cp install.sh uninstall.sh install.ps1 uninstall.ps1 dist/
           (cd dist && sha256sum -- * > SHA256SUMS)
           cat dist/SHA256SUMS
 
