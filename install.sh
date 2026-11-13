@@ -25,7 +25,30 @@ need() { command -v "$1" >/dev/null 2>&1 || {
 }; }
 
 need curl
-need unzip
+
+# Every request: https only, bounded connect time, retries on transient errors,
+# so a blocked or flaky host fails in seconds instead of hanging for minutes.
+CURL=(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --retry 2 --retry-delay 1)
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "error: need 'sha256sum' or 'shasum' on PATH" >&2
+    return 1
+  fi
+}
+
+verify_sha256() {
+  local actual
+  actual="$(sha256_of "$1")" || exit 1
+  [[ "$actual" = "$2" ]] || {
+    echo "error: $3 checksum mismatch (expected $2, got $actual)" >&2
+    exit 1
+  }
+}
 
 # ------ platform detection ------
 
@@ -56,22 +79,45 @@ esac
 
 # ------ version resolution ------
 
+# github.com, api.github.com and the release-asset CDN are IPv4-only, so an
+# IPv6-only host (or broken IPv4 NAT) can fetch this script yet nothing else.
+GH_UNREACHABLE="cannot reach github.com:443. GitHub release downloads are IPv4-only: check this machine's IPv4 connectivity, or set https_proxy"
+
+# Primary: the github.com "latest release" redirect (no API, no rate limit).
+# Fallback: the REST API. Either way the result must look like a tag.
+resolve_latest() {
+  local url tag="" rc=0
+  url="$(curl -sS --proto '=https' --connect-timeout 8 --retry 2 --retry-delay 1 \
+    -o /dev/null -w '%{redirect_url}' "https://github.com/$RH_REPO/releases/latest")" || rc=$?
+
+  if [[ $rc -eq 6 || $rc -eq 7 || $rc -eq 28 ]]; then
+    echo "error: $GH_UNREACHABLE" >&2
+    return 2
+  fi
+  [[ "$url" = */releases/tag/* ]] && tag="${url##*/releases/tag/}"
+  if [[ ! "$tag" =~ ^v[0-9] ]]; then
+    tag="$("${CURL[@]}" "https://api.github.com/repos/$RH_REPO/releases/latest" |
+      awk -F'"' '/"tag_name"/ && !seen { tag = $4; seen = 1 } END { print tag }')" || tag=""
+  fi
+  [[ "$tag" =~ ^v[0-9] ]] && printf '%s' "$tag"
+}
+
 if [[ -z "${RH_VERSION:-}" ]]; then
   log "resolving latest rh release..."
-  RH_VERSION="$(
-    curl -fsSL --proto '=https' --proto-redir '=https' \
-      "https://api.github.com/repos/$RH_REPO/releases/latest" |
-      awk -F'"' '/"tag_name"/ && !seen { tag = $4; seen = 1 } END { print tag }'
-  )" || RH_VERSION=""
+  rc=0
+  RH_VERSION="$(resolve_latest)" || rc=$?
+  [[ $rc -ne 2 ]] || exit 1
   [[ -n "$RH_VERSION" ]] || {
-    echo "error: could not resolve latest release (set RH_VERSION=vX.Y.Z)" >&2
+    echo "error: could not resolve latest release from github.com (set RH_VERSION=vX.Y.Z)" >&2
     exit 1
   }
 fi
+
+[[ "$RH_VERSION" = v* ]] || RH_VERSION="v$RH_VERSION"
 log "rh $RH_VERSION for $TARGET"
 log "config: prefix=$RH_PREFIX cloudflared=$WITH_CLOUDFLARED dry-run=$RH_DRY_RUN"
 
-# ------ tempory working directory ------
+# ------ temporary working directory ------
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -87,10 +133,26 @@ if [[ -n "$INSTALLED_RH" ]] && [[ "v$INSTALLED_RH" = "$RH_VERSION" ]]; then
   log "rh $RH_VERSION already installed — skipping"
 else
   log "downloading rh $RH_VERSION..."
-  run curl -fsSL --proto '=https' --proto-redir '=https' -o "$TMP/rh.zip" "https://github.com/$RH_REPO/releases/download/$RH_VERSION/rh-$RH_VERSION-$TARGET.zip"
-  run mkdir -p "$RH_PREFIX/bin"
-  run unzip -o -q "$TMP/rh.zip" -d "$TMP/rh-out"
-  run install -m 755 "$TMP/rh-out/rh" "$RH_PREFIX/bin/rh"
+  REL_URL="https://github.com/$RH_REPO/releases/download/$RH_VERSION"
+  ASSET="rh-$RH_VERSION-$TARGET"
+  if [[ "$RH_DRY_RUN" = "1" ]]; then
+    printf '  + curl %s/%s.tar.gz\n' "$REL_URL" "$ASSET"
+    printf '  + install -m 755 rh %s/bin/rh\n' "$RH_PREFIX"
+  else
+    ARCHIVE="$ASSET.tar.gz"
+    rc=0
+    "${CURL[@]}" -o "$TMP/$ARCHIVE" "$REL_URL/$ARCHIVE" || rc=$?
+    if [[ $rc -eq 6 || $rc -eq 7 || $rc -eq 28 ]]; then
+      echo "error: $GH_UNREACHABLE" >&2
+      exit 1
+    elif [[ $rc -ne 0 ]]; then
+      echo "error: no rh $RH_VERSION build for $TARGET at $REL_URL (does the release exist?)" >&2
+      exit 1
+    fi
+    mkdir -p "$TMP/rh-out" "$RH_PREFIX/bin"
+    tar -xzf "$TMP/$ARCHIVE" -C "$TMP/rh-out"
+    install -m 755 "$TMP/rh-out/rh" "$RH_PREFIX/bin/rh"
+  fi
   log "installed $RH_PREFIX/bin/rh"
 fi
 
@@ -103,7 +165,7 @@ if [[ "$WITH_CLOUDFLARED" = "1" ]]; then
     CF_VERSION="<from pin>"
     CF_SHA="<from pin>"
   else
-    curl -fsSL --proto '=https' --proto-redir '=https' -o "$TMP/cloudflared.pin" "$PIN_URL" ||
+    "${CURL[@]}" -o "$TMP/cloudflared.pin" "$PIN_URL" ||
       {
         echo "error: could not fetch $PIN_URL" >&2
         exit 1
@@ -124,7 +186,7 @@ if [[ "$WITH_CLOUDFLARED" = "1" ]]; then
   if [[ -n "$INSTALLED_CF" ]] && [[ "$INSTALLED_CF" = "$CF_VERSION" ]]; then
     log "cloudflared $CF_VERSION already installed — skipping"
   else
-    run curl -fsSL --proto '=https' --proto-redir '=https' -o "$TMP/cf-asset" "https://github.com/cloudflare/cloudflared/releases/download/$CF_VERSION/$CF_ASSET"
+    run "${CURL[@]}" -o "$TMP/cf-asset" "https://github.com/cloudflare/cloudflared/releases/download/$CF_VERSION/$CF_ASSET"
     case "$CF_ASSET" in
     *.tgz)
       CF_BIN="$TMP/cf-asset-bin"
@@ -137,19 +199,7 @@ if [[ "$WITH_CLOUDFLARED" = "1" ]]; then
     if [[ "$RH_DRY_RUN" = "1" ]]; then
       printf '  + verify sha256 %s\n' "$CF_SHA"
     else
-      if command -v sha256sum >/dev/null 2>&1; then
-        echo "$CF_SHA  $CF_SRC" | sha256sum -c - ||
-          {
-            echo "error: cloudflared checksum mismatch" >&2
-            exit 1
-          }
-      else
-        echo "$CF_SHA  $CF_SRC" | shasum -a 256 -c - ||
-          {
-            echo "error: cloudflared checksum mismatch" >&2
-            exit 1
-          }
-      fi
+      verify_sha256 "$CF_SRC" "$CF_SHA" "cloudflared"
     fi
     run mkdir -p "$DATA_DIR/rh/bin"
     run install -m 755 "$CF_SRC" "$DATA_DIR/rh/bin/cloudflared"
@@ -161,7 +211,7 @@ fi
 
 case ":$PATH:" in
 *":$RH_PREFIX/bin:"*) ;;
-*) log "add to PATH, e.g.:  export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+*) log "add to PATH, e.g.:  export PATH=\"$RH_PREFIX/bin:\$PATH\"" ;;
 esac
 log "to uninstall later: curl -fsSL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/$RH_REPO/$RH_VERSION/uninstall.sh | bash"
 log "done. Run:  rh check"
