@@ -10,7 +10,7 @@
 class Rh < Formula
   desc "Send files and folders as-is, nothing stored in between, hash-verified per block."
   homepage "https://github.com/DavidMANZI-093/rabbit-hole"
-  version "0.1.0"
+  version "1.0.0"
   license "MIT"
 
   livecheck do
@@ -22,23 +22,23 @@ class Rh < Formula
 
   on_macos do
     on_intel do
-      url "https://github.com/DavidMANZI-093/rabbit-hole/releases/download/v0.1.0/rh-v0.1.0-x86_64-apple-darwin.zip"
-      sha256 "5d84cad79d0985fb9d04c13e27be9c6d2748971b58fbdac66422061f28ecdc51"
+      url "https://github.com/DavidMANZI-093/rabbit-hole/releases/download/v1.0.0/rh-v1.0.0-x86_64-apple-darwin.zip"
+      sha256 "c6bcba1359cc7c0bba9b4d818193cce6f6bc1c7806f33a7a32203765b065960e"
     end
     on_arm do
-      url "https://github.com/DavidMANZI-093/rabbit-hole/releases/download/v0.1.0/rh-v0.1.0-aarch64-apple-darwin.zip"
-      sha256 "8daac640fc6a48c6c856dbb3446484bf37c35042663f909fc29dac5fca2540ca"
+      url "https://github.com/DavidMANZI-093/rabbit-hole/releases/download/v1.0.0/rh-v1.0.0-aarch64-apple-darwin.zip"
+      sha256 "700c75dd5871c4b06e912f56170284ccb6f803f6e923fb18eb8a7dc394e4c126"
     end
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/DavidMANZI-093/rabbit-hole/releases/download/v0.1.0/rh-v0.1.0-x86_64-unknown-linux-gnu.zip"
-      sha256 "6c851d386daf8833e231f9666520984347e81f469ebd9eb8be7b76f50e712375"
+      url "https://github.com/DavidMANZI-093/rabbit-hole/releases/download/v1.0.0/rh-v1.0.0-x86_64-unknown-linux-gnu.zip"
+      sha256 "45ec2ddfc8f99cb99fb21befb6f735e06c417b05ed2716c9811dc8b1ec00cea3"
     end
     on_arm do
-      url "https://github.com/DavidMANZI-093/rabbit-hole/releases/download/v0.1.0/rh-v0.1.0-aarch64-unknown-linux-gnu.zip"
-      sha256 "f50ac931261a8029db20f25ace80d63609977ff58291105fc1aef4a6c4cf8cba"
+      url "https://github.com/DavidMANZI-093/rabbit-hole/releases/download/v1.0.0/rh-v1.0.0-aarch64-unknown-linux-gnu.zip"
+      sha256 "f3e50d3a2072aca17b7c093683d8d205baf5527c81ef2b849921341d6e57e45d"
     end
   end
 
