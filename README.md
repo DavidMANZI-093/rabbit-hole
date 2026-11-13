@@ -2,6 +2,12 @@
 
 **`rh` in short.**
 
+[![check](https://github.com/DavidMANZI-093/rabbit-hole/actions/workflows/check.yml/badge.svg?branch=main)](https://github.com/DavidMANZI-093/rabbit-hole/actions/workflows/check.yml)
+[![audit](https://github.com/DavidMANZI-093/rabbit-hole/actions/workflows/audit.yml/badge.svg?branch=main)](https://github.com/DavidMANZI-093/rabbit-hole/actions/workflows/audit.yml)
+[![release](https://img.shields.io/github/v/release/DavidMANZI-093/rabbit-hole)](https://github.com/DavidMANZI-093/rabbit-hole/releases/latest)
+[![license](https://img.shields.io/github/license/DavidMANZI-093/rabbit-hole)](https://github.com/DavidMANZI-093/rabbit-hole/blob/main/LICENSE)
+[![dependencies](https://deps.rs/repo/github/DavidMANZI-093/rabbit-hole/status.svg)](https://deps.rs/repo/github/DavidMANZI-093/rabbit-hole)
+
 rabbit-hole is a command-line file transfer utility for sharing **files and folders as they are**. It doesn't require archiving, repackaging, or storing anything in between.
 
 sender's end,
