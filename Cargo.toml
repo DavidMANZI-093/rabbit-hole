@@ -1,6 +1,6 @@
 [package]
 name = "rabbit-hole"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 description = "Send files and folders as-is, nothing stored in between, hash-verified per block."
 license = "MIT"
