@@ -54,15 +54,19 @@ fn installers_parse() {
 }
 
 #[test]
-fn unix_installer_does_not_require_unzip() {
+fn unix_installer_uses_tar_gz_only() {
     let sh = read("install.sh");
     assert!(
-        !sh.contains("need unzip"),
-        "unzip is missing on minimal images; it must stay an optional .zip fallback"
+        sh.contains(".tar.gz"),
+        "install.sh must use the .tar.gz archive"
     );
     assert!(
-        sh.contains(".tar.gz"),
-        "install.sh must prefer the .tar.gz archive"
+        !sh.contains(".zip"),
+        "install.sh must not fall back to the redundant .zip archive"
+    );
+    assert!(
+        !sh.contains("need unzip"),
+        "unzip is not needed for Unix releases"
     );
 }
 
@@ -97,12 +101,15 @@ fn installers_bound_network_waits() {
 #[test]
 fn release_publishes_what_installers_fetch() {
     let wf = read(".github/workflows/build.yml");
-    for needle in [".tar.gz", ".zip"] {
-        assert!(
-            wf.contains(needle),
-            "build.yml must publish {needle} archives"
-        );
-    }
+    assert!(
+        wf.contains(r#"if [[ "$name" == *windows* ]]; then"#),
+        "build.yml must choose the archive format per platform"
+    );
+    assert!(wf.contains("zip -q -X"), "Windows must publish a .zip");
+    assert!(
+        wf.contains(".tar.gz"),
+        "Unix must publish a .tar.gz archive"
+    );
     // asset naming must agree between the workflow and the installers
     assert!(wf.contains("name: rh-${{ github.ref_name }}-${{ matrix.target }}"));
     assert!(read("install.sh").contains("ASSET=\"rh-$RH_VERSION-$TARGET\""));

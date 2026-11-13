@@ -50,25 +50,6 @@ verify_sha256() {
   }
 }
 
-# Extract a .zip without hard-requiring `unzip` (absent on minimal images).
-extract_zip() {
-  mkdir -p "$2"
-  if command -v unzip >/dev/null 2>&1; then
-    unzip -o -q "$1" -d "$2"
-  elif command -v bsdtar >/dev/null 2>&1; then
-    bsdtar -xf "$1" -C "$2"
-  elif [[ "$OS" = "Darwin" ]]; then
-    tar -xf "$1" -C "$2"
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -m zipfile -e "$1" "$2"
-  elif command -v busybox >/dev/null 2>&1; then
-    busybox unzip -o -q "$1" -d "$2"
-  else
-    echo "error: this release only ships .zip archives; install 'unzip' (or python3/bsdtar) and retry" >&2
-    exit 1
-  fi
-}
-
 # ------ platform detection ------
 
 OS="$(uname -s)"
@@ -155,18 +136,12 @@ else
   REL_URL="https://github.com/$RH_REPO/releases/download/$RH_VERSION"
   ASSET="rh-$RH_VERSION-$TARGET"
   if [[ "$RH_DRY_RUN" = "1" ]]; then
-    printf '  + curl %s/%s.tar.gz (falls back to .zip)\n' "$REL_URL" "$ASSET"
+    printf '  + curl %s/%s.tar.gz\n' "$REL_URL" "$ASSET"
     printf '  + install -m 755 rh %s/bin/rh\n' "$RH_PREFIX"
   else
-
     ARCHIVE="$ASSET.tar.gz"
     rc=0
-    "${CURL[@]}" -o "$TMP/$ARCHIVE" "$REL_URL/$ARCHIVE" 2>/dev/null || rc=$?
-    if [[ $rc -eq 22 ]]; then
-      ARCHIVE="$ASSET.zip"
-      rc=0
-      "${CURL[@]}" -o "$TMP/$ARCHIVE" "$REL_URL/$ARCHIVE" || rc=$?
-    fi
+    "${CURL[@]}" -o "$TMP/$ARCHIVE" "$REL_URL/$ARCHIVE" || rc=$?
     if [[ $rc -eq 6 || $rc -eq 7 || $rc -eq 28 ]]; then
       echo "error: $GH_UNREACHABLE" >&2
       exit 1
@@ -175,10 +150,7 @@ else
       exit 1
     fi
     mkdir -p "$TMP/rh-out" "$RH_PREFIX/bin"
-    case "$ARCHIVE" in
-    *.tar.gz) tar -xzf "$TMP/$ARCHIVE" -C "$TMP/rh-out" ;;
-    *) extract_zip "$TMP/$ARCHIVE" "$TMP/rh-out" ;;
-    esac
+    tar -xzf "$TMP/$ARCHIVE" -C "$TMP/rh-out"
     install -m 755 "$TMP/rh-out/rh" "$RH_PREFIX/bin/rh"
   fi
   log "installed $RH_PREFIX/bin/rh"

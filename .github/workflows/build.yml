@@ -130,8 +130,9 @@ jobs:
             name="$(basename "$dir")"
             bin="$(find "$dir" -maxdepth 1 -type f | head -n1)"
             chmod 755 "$bin"
-            (cd "$dir" && zip -q -X "$OLDPWD/dist/$name.zip" "$(basename "$bin")")
-            if [[ "$name" != *windows* ]]; then
+            if [[ "$name" == *windows* ]]; then
+              (cd "$dir" && zip -q -X "$OLDPWD/dist/$name.zip" "$(basename "$bin")")
+            else
               tar -C "$dir" --owner=0 --group=0 --numeric-owner -czf "dist/$name.tar.gz" "$(basename "$bin")"
             fi
           done
