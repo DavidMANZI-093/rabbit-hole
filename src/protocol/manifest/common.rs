@@ -200,18 +200,64 @@ pub fn validate_path(p: &str) -> Result<(), ManifestError> {
             "must be relative without empty components",
         ));
     }
-    if p.contains('\0') {
-        return Err(ManifestError::BadPath(p.into(), "NUL byte"));
-    }
     for comp in p.split('/') {
-        if comp.is_empty() || comp == "." || comp == ".." {
-            return Err(ManifestError::BadPath(
-                p.into(),
-                "dot/dotdot/empty component",
-            ));
-        }
+        validate_component(p, comp)?;
     }
     Ok(())
+}
+
+fn validate_component(p: &str, comp: &str) -> Result<(), ManifestError> {
+    if comp.is_empty() || comp == "." || comp == ".." {
+        return Err(ManifestError::BadPath(
+            p.into(),
+            "dot/dotdot/empty component",
+        ));
+    }
+    if comp.chars().any(|c| c == '\\' || c == ':' || c == '\0') {
+        return Err(ManifestError::BadPath(
+            p.into(),
+            "Windows separator, prefix, or NUL byte",
+        ));
+    }
+    if comp.chars().any(|c| c.is_control()) {
+        return Err(ManifestError::BadPath(
+            p.into(),
+            "control character in component",
+        ));
+    }
+    if comp.ends_with('.') || comp.ends_with(' ') {
+        return Err(ManifestError::BadPath(
+            p.into(),
+            "component ends with dot or space",
+        ));
+    }
+
+    let stem: &str = comp
+        .split('.')
+        .next()
+        .unwrap_or(comp)
+        .trim_end_matches([' ', '.']);
+    if is_windows_reserved_name(stem) {
+        return Err(ManifestError::BadPath(
+            p.into(),
+            "Windows reserved device name",
+        ));
+    }
+    Ok(())
+}
+
+fn is_windows_reserved_name(stem: &str) -> bool {
+    let name: String = stem.to_ascii_uppercase();
+    if matches!(
+        name.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let bytes: &[u8] = name.as_bytes();
+    bytes.len() == 4
+        && (name.starts_with("COM") || name.starts_with("LPT"))
+        && matches!(bytes[3], b'1'..=b'9')
 }
 
 pub fn expected_chunks(size: u64, block_size: u32) -> u64 {
@@ -294,6 +340,65 @@ mod tests {
     #[test]
     fn null_byte_is_rejected() {
         assert!(validate_path("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn backslash_dotdot_is_rejected() {
+        assert!(validate_path("..\\..\\evil.txt").is_err());
+        assert!(validate_path("foo/..\\..\\evil.txt").is_err());
+    }
+
+    #[test]
+    fn windows_drive_prefix_is_rejected() {
+        assert!(validate_path("C:\\Users\\evil.txt").is_err());
+        assert!(validate_path("C:evil.txt").is_err());
+    }
+
+    #[test]
+    fn unc_prefix_is_rejected() {
+        assert!(validate_path("\\\\server\\share\\evil.txt").is_err());
+        assert!(validate_path("\\\\?\\C:\\evil.txt").is_err());
+        assert!(validate_path("\\\\.\\NUL").is_err());
+    }
+
+    #[test]
+    fn windows_alternate_data_stream_is_rejected() {
+        assert!(validate_path("file:stream").is_err());
+        assert!(validate_path("dir/file:stream").is_err());
+    }
+
+    #[test]
+    fn control_characters_are_rejected() {
+        assert!(validate_path("foo\tbar").is_err());
+        assert!(validate_path("foo\nbar").is_err());
+    }
+
+    #[test]
+    fn trailing_dot_or_space_is_rejected() {
+        assert!(validate_path("foo.").is_err());
+        assert!(validate_path("foo ").is_err());
+        assert!(validate_path("dir/bar.").is_err());
+        assert!(validate_path("dir/bar ").is_err());
+    }
+
+    #[test]
+    fn windows_reserved_names_are_rejected() {
+        for name in [
+            "CON", "con", "PRN", "AUX", "NUL.txt", "COM1", "com9.log", "LPT1", "lpt9.txt",
+            "CONIN$", "CONOUT$", "dir/CON", "CON .txt",
+        ] {
+            assert!(
+                validate_path(name).is_err(),
+                "accepted reserved name {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_prefix_without_device_number_is_accepted() {
+        assert!(validate_path("COM0").is_ok());
+        assert!(validate_path("LPT0").is_ok());
+        assert!(validate_path("CONSOLE.txt").is_ok());
     }
 
     #[test]
