@@ -1,4 +1,4 @@
-# rabbit-hole
+## rabbit-hole
 
 **`rh` in short.**
 
@@ -20,21 +20,21 @@ No account. No archive. No file storage in the middle.
 
 ### 1. Install
 
-**Linux / macOS &mdash; [source](https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v0.1.0/install.sh)**
+**Linux / macOS &mdash; [source](https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v1.0.0/install.sh)**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v0.1.0/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v1.0.0/install.sh | bash
 ```
 
-**Windows (PowerShell) &mdash; [source](https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v0.1.0/install.ps1)**
+**Windows (PowerShell) &mdash; [source](https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v1.0.0/install.ps1)**
 
 (_May require restarting your shell to reload `PATH`._)
 
 ```powershell
-irm https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v0.1.0/install.ps1 | iex
+irm https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v1.0.0/install.ps1 | iex
 ```
 
-The installer places `rh` under your user directory, fetches a [pinned](https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v0.1.0/third-party/cloudflared.pin) `cloudflared` version (for [encrypted tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/#:~:text=Cloudflare%20Tunnel%20provides,that%20bypass%20Cloudflare.)), and does not require root access.
+The installer places `rh` under your user directory, fetches a [pinned](https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v1.0.0/third-party/cloudflared.pin) `cloudflared` version (for [encrypted tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/#:~:text=Cloudflare%20Tunnel%20provides,that%20bypass%20Cloudflare.)), and does not require root access.
 
 After installing, run:
 
@@ -46,16 +46,16 @@ This reports whether `rh` can find a compatible `cloudflared`.
 
 #### i. Uninstall
 
-**Linux / macOS &mdash; [source](https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v0.1.0/uninstall.sh)**
+**Linux / macOS &mdash; [source](https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v1.0.0/uninstall.sh)**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v0.1.0/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v1.0.0/uninstall.sh | bash
 ```
 
-**Windows (PowerShell) &mdash; [source](https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v0.1.0/uninstall.ps1)**
+**Windows (PowerShell) &mdash; [source](https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v1.0.0/uninstall.ps1)**
 
 ```powershell
-irm https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v0.1.0/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v1.0.0/uninstall.ps1 | iex
 ```
 
 ### 2. Quick start
@@ -182,7 +182,7 @@ The manifest is portable and does not depend on the sender's local paths. File d
 ### 7. Requirements
 
 - Linux, macOS, or Windows on a supported 64-bit architecture.
-- `cloudflared` for public tunneling. The installers provide a [pinned](https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v0.1.0/third-party/cloudflared.pin) copy; `rh check` reports its status.
+- `cloudflared` for public tunneling. The installers provide a [pinned](https://raw.githubusercontent.com/DavidMANZI-093/rabbit-hole/v1.0.0/third-party/cloudflared.pin) copy; `rh check` reports its status.
 - Rust with edition 2024 support, only when building from source.
 
 `--local` does not need a public tunnel. A missing or outdated `cloudflared` only prevents public sharing, not local-network transfers.
