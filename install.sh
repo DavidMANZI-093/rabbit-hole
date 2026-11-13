@@ -137,6 +137,7 @@ else
   ASSET="rh-$RH_VERSION-$TARGET"
   if [[ "$RH_DRY_RUN" = "1" ]]; then
     printf '  + curl %s/%s.tar.gz\n' "$REL_URL" "$ASSET"
+    printf '  + verify sha256 from %s/SHA256SUMS (when published)\n' "$REL_URL"
     printf '  + install -m 755 rh %s/bin/rh\n' "$RH_PREFIX"
   else
     ARCHIVE="$ASSET.tar.gz"
@@ -148,6 +149,16 @@ else
     elif [[ $rc -ne 0 ]]; then
       echo "error: no rh $RH_VERSION build for $TARGET at $REL_URL (does the release exist?)" >&2
       exit 1
+    fi
+    if "${CURL[@]}" -o "$TMP/SHA256SUMS" "$REL_URL/SHA256SUMS" 2>/dev/null; then
+      RH_SHA="$(awk -v f="$ARCHIVE" '$2 == f || $2 == "*" f { print $1; exit }' "$TMP/SHA256SUMS")"
+      [[ -n "$RH_SHA" ]] || {
+        echo "error: SHA256SUMS has no entry for $ARCHIVE" >&2
+        exit 1
+      }
+      verify_sha256 "$TMP/$ARCHIVE" "$RH_SHA" "rh"
+    else
+      log "warning: $RH_VERSION publishes no SHA256SUMS; skipping rh checksum"
     fi
     mkdir -p "$TMP/rh-out" "$RH_PREFIX/bin"
     tar -xzf "$TMP/$ARCHIVE" -C "$TMP/rh-out"

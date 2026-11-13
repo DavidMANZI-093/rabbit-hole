@@ -26,8 +26,25 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+
+  verify-tag:
+    name: verify tag matches Cargo.toml
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: compare versions
+        shell: bash
+        run: |
+          crate="$(awk -F'"' '/^version *=/ { print $2; exit }' Cargo.toml)"
+          if [[ "v$crate" != "${GITHUB_REF_NAME}" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
   build:
     name: build (${{ matrix.target }} @ ${{ github.ref_name }})
+    needs: verify-tag
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
@@ -117,11 +134,14 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v7
         with:
           path: dist-artifacts
 
-      - name: package archives
+
+      - name: package archives + checksums
         shell: bash
         run: |
           set -euo pipefail
@@ -136,7 +156,9 @@ jobs:
               tar -C "$dir" --owner=0 --group=0 --numeric-owner -czf "dist/$name.tar.gz" "$(basename "$bin")"
             fi
           done
-          ls -l dist
+          cp install.sh uninstall.sh install.ps1 uninstall.ps1 dist/
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          cat dist/SHA256SUMS
 
       - name: attach to GitHub release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3

@@ -79,6 +79,24 @@ try {
             try { Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing }
             catch { throw "could not download rh $Version for $Target from $zipUrl (does the release exist?): $($_.Exception.Message)" }
         }
+        # Releases from v1.0.1 publish SHA256SUMS; older ones are installed unverified.
+        $zipName = Split-Path $zipUrl -Leaf
+        if ($DryRun) {
+            Write-Host "  + verify sha256 from SHA256SUMS (when published)"
+        } else {
+            $sums = $null
+            try { $sums = (Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$Version/SHA256SUMS" -UseBasicParsing).Content } catch { }
+            if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
+            if ([string]::IsNullOrEmpty($sums)) {
+                Write-Host "  warning: $Version publishes no SHA256SUMS; skipping rh checksum"
+            } else {
+                $line = ($sums -split "`n") | Where-Object { ($_ -split '\s+')[1] -in @($zipName, "*$zipName") } | Select-Object -First 1
+                if (-not $line) { throw "SHA256SUMS has no entry for $zipName" }
+                $expected = ($line -split '\s+')[0]
+                $actual = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
+                if ($actual.ToLower() -ne $expected.ToLower()) { throw "rh checksum mismatch" }
+            }
+        }
         Invoke-Step "install $binDir\rh.exe" {
             New-Item -ItemType Directory -Path $binDir -Force | Out-Null
             Expand-Archive -Path $zipPath -DestinationPath $tmp -Force

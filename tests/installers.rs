@@ -110,8 +110,17 @@ fn release_publishes_what_installers_fetch() {
         wf.contains(".tar.gz"),
         "Unix must publish a .tar.gz archive"
     );
+    for needle in ["SHA256SUMS", "install.sh", "install.ps1"] {
+        assert!(wf.contains(needle), "build.yml must publish {needle}");
+    }
+    assert!(
+        wf.contains("Cargo.toml") && wf.contains("GITHUB_REF_NAME"),
+        "build.yml must check the tag against Cargo.toml"
+    );
     // asset naming must agree between the workflow and the installers
     assert!(wf.contains("name: rh-${{ github.ref_name }}-${{ matrix.target }}"));
     assert!(read("install.sh").contains("ASSET=\"rh-$RH_VERSION-$TARGET\""));
     assert!(read("install.ps1").contains("rh-$Version-$Target.zip"));
+    assert!(read("install.sh").contains("SHA256SUMS"));
+    assert!(read("install.ps1").contains("SHA256SUMS"));
 }
