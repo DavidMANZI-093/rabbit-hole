@@ -466,6 +466,29 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ingest_strips_special_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("rh-ingest-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o6755)).unwrap();
+
+        let progress = crate::utils::progress::IngestProgress::_new();
+        let (manifest, _) = ingest(
+            &file,
+            crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE,
+            &progress,
+        )
+        .expect("ingest must succeed");
+
+        assert_eq!(manifest.files[0].mode, Some(0o755));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn dir_ingest_records_wrapper_root() {
         use crate::protocol::manifest::common::DEFAULT_BLOCK_SIZE;
